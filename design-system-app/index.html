@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>数据库同步工具 · Design System v1.0</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ==========================================================
+   Design Tokens · Semantic Color（暗色默认，亮色一键切换）
+   与画布 Semantic Color 变量集一一对应
+   ========================================================== */
+:root, [data-theme="dark"] {
+  --bg-base: #0A0A0B;
+  --bg-card: #141417;
+  --bg-elevated: #18181D;
+  --border: #262629;
+  --border-strong: #404045;
+  --text-primary: #FAFAFA;
+  --text-secondary: #A1A1AA;
+  --text-tertiary: #75757A;
+  --accent: #7C3AED;
+  --accent-hover: #9952F7;
+  --info: #21D4ED;
+  --success: #0FBA82;
+  --warning: #F59E0A;
+  --error: #F5405E;
+  --font-ui: "Noto Sans SC", "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+}
+[data-theme="light"] {
+  --bg-base: #FAFAFA;
+  --bg-card: #FFFFFF;
+  --bg-elevated: #FCFCFC;
+  --border: #E0E3E5;
+  --border-strong: #B8BABF;
+  --text-primary: #171717;
+  --text-secondary: #6B6B6B;
+  --text-tertiary: #999999;
+  --accent: #7D3BED;
+  --accent-hover: #6629ED;
+  --info: #0AB0D9;
+  --success: #059966;
+  --warning: #C97A0D;
+  --error: #D9293D;
+}
+/* 画布内嵌「亮色面板」局部作用域：无论全局主题如何，恒以亮色 Token 渲染 */
+.scope-light {
+  --bg-base: #FAFAFA;
+  --bg-card: #FFFFFF;
+  --bg-elevated: #FCFCFC;
+  --border: #E0E3E5;
+  --border-strong: #B8BABF;
+  --text-primary: #171717;
+  --text-secondary: #6B6B6B;
+  --text-tertiary: #999999;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  transition: background .25s ease, color .25s ease;
+}
+::selection { background: rgba(124,58,237,.35); }
+
+/* ---------- 顶栏（WS 断线横幅式的全局状态位） ---------- */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: space-between;
+  height: 56px; padding: 0 32px;
+  background: color-mix(in srgb, var(--bg-base) 85%, transparent);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.topbar-brand { display: flex; align-items: center; gap: 10px; }
+.brand-dot { width: 8px; height: 8px; border-radius: 9999px; background: var(--accent); box-shadow: 0 0 10px rgba(124,58,237,.6); }
+.brand-name { font-size: 13px; font-weight: 500; color: var(--text-primary); }
+.brand-ver { font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary); }
+.topbar-right { display: flex; align-items: center; gap: 20px; }
+.topbar-nav { display: flex; gap: 4px; }
+.topbar-nav a {
+  font-size: 12px; font-weight: 500; color: var(--text-secondary);
+  text-decoration: none; padding: 6px 12px; border-radius: 9999px;
+  transition: background .15s, color .15s;
+}
+.topbar-nav a:hover { background: var(--bg-elevated); color: var(--text-primary); }
+.theme-toggle {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-ui); font-size: 12px; font-weight: 500;
+  color: var(--text-primary); background: var(--bg-elevated);
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  padding: 7px 14px; cursor: pointer; transition: border-color .15s, background .15s;
+}
+.theme-toggle:hover { border-color: var(--accent); }
+.theme-toggle .icon { width: 14px; height: 14px; }
+
+/* ---------- 页面容器（对应画布 1440 页框 · padding 64） ---------- */
+.page {
+  max-width: 1440px; margin: 0 auto;
+  padding: 64px;
+  display: flex; flex-direction: column;
+}
+.page-01 { gap: 48px; }
+.page-02 { gap: 40px; padding-top: 40px; }
+.divider { width: 100%; height: 1px; background: var(--border); border: none; }
+
+/* ---------- 01 · Hero 区 ---------- */
+.hero { display: flex; flex-direction: column; gap: 20px; }
+.badge {
+  align-self: flex-start;
+  display: inline-flex; align-items: center;
+  padding: 6px 12px; border-radius: 9999px;
+  background: rgba(124,58,237,.15);
+  border: 1px solid rgba(124,58,237,.4);
+  font-size: 12px; font-weight: 500; color: #C4B5FD;
+}
+.hero-title {
+  font-size: 40px; font-weight: 700; letter-spacing: -1px;
+  color: var(--text-primary); line-height: 1.2;
+}
+.hero-subtitle { font-size: 16px; font-weight: 400; color: var(--text-secondary); max-width: 720px; line-height: 1.6; }
+.hero-meta { font-size: 12px; font-weight: 400; color: var(--text-tertiary); }
+
+/* ---------- 小节标题 ---------- */
+.section-head { display: flex; flex-direction: column; gap: 8px; }
+.section-title { font-size: 20px; font-weight: 600; color: var(--text-primary); }
+.section-desc { font-size: 13px; font-weight: 400; color: var(--text-tertiary); line-height: 1.6; max-width: 900px; }
+
+/* ---------- 设计原则卡片（行 gap 16 · 卡片 padding 20 gap 8 r8） ---------- */
+.principles-row { display: flex; gap: 16px; }
+.principle-card {
+  flex: 1;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 20px; border-radius: 8px;
+  background: var(--bg-card); border: 1px solid var(--border);
+}
+.principle-num { font-size: 11px; font-weight: 600; letter-spacing: .5px; color: #A78BFA; }
+.principle-title { font-size: 16px; font-weight: 600; color: var(--text-primary); }
+.principle-desc { font-size: 12px; font-weight: 400; color: var(--text-secondary); line-height: 1.7; }
+
+/* ---------- 语义色 Chip（h120 · 渐变自上而下 → 5%） ---------- */
+.chips-row { display: flex; gap: 16px; }
+.chip {
+  flex: 1; height: 120px; border-radius: 8px; overflow: hidden;
+  display: flex; flex-direction: column; justify-content: flex-end;
+  padding: 0 12px 12px; border: 1px solid var(--border);
+  background: var(--bg-card);
+}
+.chip-accent  { background: linear-gradient(180deg, #7C3AED 0%, rgba(124,58,237,.05) 100%), var(--bg-card); }
+.chip-info    { background: linear-gradient(180deg, #21D4ED 0%, rgba(33,212,237,.05) 100%), var(--bg-card); }
+.chip-success { background: linear-gradient(180deg, #0FBA82 0%, rgba(15,186,130,.05) 100%), var(--bg-card); }
+.chip-warning { background: linear-gradient(180deg, #F59E0A 0%, rgba(245,158,10,.05) 100%), var(--bg-card); }
+.chip-error   { background: linear-gradient(180deg, #F5405E 0%, rgba(245,64,94,.05) 100%), var(--bg-card); }
+.chip-label { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: #FAFAFA; line-height: 1.6; white-space: pre-line; }
+
+/* ---------- 应用示例卡 ---------- */
+.examples-row { display: flex; gap: 16px; }
+.example-card {
+  flex: 1; display: flex; flex-direction: column; gap: 16px;
+  padding: 20px; border-radius: 8px;
+  background: var(--bg-card); border: 1px solid var(--border);
+}
+.example-caption { font-size: 11px; font-weight: 500; color: var(--text-tertiary); }
+/* 任务行：h40 r6 · 数据先行 */
+.task-row {
+  display: flex; align-items: center; gap: 12px;
+  height: 40px; padding: 0 12px; border-radius: 6px;
+  background: var(--bg-base);
+}
+.task-name { font-size: 14px; font-weight: 600; color: var(--text-primary); white-space: nowrap; }
+.spacer { flex: 1; }
+.task-position { font-family: var(--font-mono); font-size: 12px; font-weight: 400; color: var(--text-tertiary); white-space: nowrap; }
+.task-lag-ok { font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: #34D399; }
+/* 状态胶囊：色点 + 文字（可访问性） */
+.status-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 12px; border-radius: 9999px;
+  font-size: 12px; font-weight: 500; color: var(--text-primary);
+  white-space: nowrap;
+}
+.status-pill .dot { width: 6px; height: 6px; border-radius: 9999px; }
+.sp-success { background: rgba(15,186,130,.15); }  .sp-success .dot { background: var(--success); }
+.sp-warning { background: rgba(245,158,10,.15); }  .sp-warning .dot { background: var(--warning); }
+.sp-error   { background: rgba(245,64,94,.15); }   .sp-error .dot { background: var(--error); }
+.sp-info    { background: rgba(33,212,237,.15); }  .sp-info .dot { background: var(--info); }
+.sp-accent  { background: rgba(124,58,237,.15); }  .sp-accent .dot { background: var(--accent); }
+.sp-neutral { background: rgba(166,166,179,.15); } .sp-neutral .dot { background: #A6A6B3; }
+/* DDL 代码块（等宽 · 青色数据语义） */
+.ddl-title-row { display: flex; align-items: center; gap: 12px; }
+.ddl-title { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+.code-block {
+  padding: 16px; border-radius: 6px;
+  background: var(--bg-base); border: 1px solid var(--border);
+}
+.code-block code {
+  font-family: var(--font-mono); font-size: 13px; font-weight: 400;
+  color: var(--info); line-height: 1.7; white-space: pre; display: block;
+}
+.btn-row { display: flex; align-items: center; gap: 12px; }
+
+/* ---------- 按钮（r6 · padding 8/16 · 13px Medium） ---------- */
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 16px; border-radius: 6px;
+  font-family: var(--font-ui); font-size: 13px; font-weight: 500;
+  cursor: pointer; border: 1px solid transparent;
+  transition: background .15s, border-color .15s;
+  white-space: nowrap;
+}
+.btn-primary { background: var(--accent); color: #FFFFFF; }
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-secondary { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-strong); }
+.btn-secondary:hover { border-color: var(--accent); }
+.btn-danger { background: var(--error); color: #FFFFFF; }
+.btn-danger:hover { filter: brightness(1.1); }
+.checkbox-hint { font-size: 12px; font-weight: 400; color: var(--text-tertiary); }
+
+/* ---------- 02 · 颜色体系 ---------- */
+/* 中性色梯度卡（h96 r8 · 标签沉底） */
+.neutral-row { display: flex; gap: 16px; }
+.neutral-card {
+  flex: 1; height: 96px; border-radius: 8px; overflow: hidden;
+  display: flex; flex-direction: column; justify-content: flex-end;
+  padding: 0 12px 10px;
+}
+.n-base    { background: #0A0A0B; border: 1px solid var(--border); }
+.n-card    { background: #141417; border: 1px solid var(--border); }
+.n-elevated{ background: #18181D; border: 1px solid var(--border); }
+.n-border  { background: #262629; }
+.n-strong  { background: #404045; }
+.neutral-label { font-family: var(--font-mono); font-size: 11px; font-weight: 500; color: #FAFAFA; line-height: 1.6; white-space: pre-line; }
+.neutral-label.dim { color: #A1A1AA; }
+
+/* 文字色三卡 */
+.text-row { display: flex; gap: 16px; }
+.text-card {
+  flex: 1; display: flex; flex-direction: column; gap: 6px;
+  padding: 20px; border-radius: 8px;
+  background: var(--bg-card); border: 1px solid var(--border);
+}
+.text-sample-primary   { font-size: 16px; font-weight: 600; color: var(--text-primary); }
+.text-sample-secondary { font-size: 16px; font-weight: 400; color: var(--text-secondary); }
+.text-sample-tertiary  { font-size: 16px; font-weight: 400; color: var(--text-tertiary); }
+.text-hex { font-family: var(--font-mono); font-size: 11px; font-weight: 400; color: var(--text-tertiary); }
+.text-use { font-size: 12px; font-weight: 400; color: var(--text-secondary); }
+
+/* 语义色使用规则行（h64 r8 · 色块32/名称180/色值200/用法自适应/禁用） */
+.semantic-list { display: flex; flex-direction: column; gap: 12px; }
+.semantic-row {
+  display: flex; align-items: center; gap: 16px;
+  height: 64px; padding: 0 16px; border-radius: 8px;
+  background: var(--bg-card); border: 1px solid var(--border);
+}
+.semantic-swatch { width: 32px; height: 32px; border-radius: 6px; flex-shrink: 0; }
+.sw-accent  { background: var(--accent); }
+.sw-info    { background: var(--info); }
+.sw-success { background: var(--success); }
+.sw-warning { background: var(--warning); }
+.sw-error   { background: var(--error); }
+.semantic-name { font-size: 14px; font-weight: 600; color: var(--text-primary); width: 180px; flex-shrink: 0; }
+.semantic-hex { font-family: var(--font-mono); font-size: 12px; font-weight: 400; color: var(--text-secondary); width: 200px; flex-shrink: 0; }
+.semantic-use { font-size: 13px; font-weight: 400; color: var(--text-secondary); flex: 1; min-width: 0; }
+.semantic-rule { font-size: 12px; font-weight: 400; color: var(--error); white-space: nowrap; }
+.semantic-rule.muted { color: var(--text-tertiary); }
+
+/* 状态机胶囊流（wrap · 行间距 12） */
+.status-flow {
+  display: flex; flex-wrap: wrap; gap: 12px 8px;
+  padding: 4px 0;
+}
+
+/* 双模式对照面板（r12 padding 20 gap 16 · 内嵌 MiniCard r8 padding 16 gap 14） */
+.mode-row { display: flex; gap: 16px; }
+.mode-panel {
+  flex: 1; display: flex; flex-direction: column; gap: 16px;
+  padding: 20px; border-radius: 12px;
+  background: var(--bg-base); border: 1px solid var(--border-strong);
+}
+.mode-caption { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.mini-card {
+  display: flex; flex-direction: column; gap: 14px;
+  padding: 16px; border-radius: 8px;
+  background: var(--bg-card); border: 1px solid var(--border);
+}
+.field-label { font-size: 12px; font-weight: 500; color: var(--text-secondary); }
+.input {
+  display: flex; align-items: center;
+  height: 36px; padding: 0 12px; border-radius: 6px;
+  background: var(--bg-elevated); border: 1px solid var(--border);
+}
+.input span { font-family: var(--font-mono); font-size: 13px; font-weight: 400; color: var(--text-primary); }
+
+/* 页脚 */
+.footer {
+  max-width: 1440px; margin: 0 auto;
+  padding: 24px 64px 48px;
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary);
+}
+
+/* 响应式（层级在所有断点下存活） */
+@media (max-width: 1100px) {
+  .principles-row, .chips-row, .examples-row, .neutral-row, .text-row, .mode-row { flex-wrap: wrap; }
+  .principle-card, .chip, .example-card, .neutral-card, .text-card, .mode-panel { min-width: 320px; }
+}
+@media (max-width: 760px) {
+  .page { padding: 32px 24px; }
+  .hero-title { font-size: 30px; }
+  .semantic-row { height: auto; flex-wrap: wrap; padding: 12px 16px; }
+  .semantic-name, .semantic-hex { width: auto; }
+  .semantic-use { flex-basis: 100%; }
+  .topbar { padding: 0 16px; }
+  .topbar-nav { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ══════════ 全局顶栏 ══════════ -->
+<header class="topbar">
+  <div class="topbar-brand">
+    <span class="brand-dot"></span>
+    <span class="brand-name">数据库同步工具 · Design System</span>
+    <span class="brand-ver">v1.0</span>
+  </div>
+  <div class="topbar-right">
+    <nav class="topbar-nav">
+      <a href="#page-01">01 封面与原则</a>
+      <a href="#sec-tokens">02 核心语义色</a>
+      <a href="#sec-status">状态机映射</a>
+      <a href="#sec-modes">双模式对照</a>
+    </nav>
+    <button class="theme-toggle" id="themeToggle" aria-label="切换明暗主题">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <span id="themeLabel">亮色模式</span>
+    </button>
+  </div>
+</header>
+
+<!-- ══════════ 01 · 封面与设计原则 ══════════ -->
+<section class="page page-01" id="page-01">
+  <div class="hero">
+    <span class="badge">MySQL 数据同步工具 · 管理台设计系统</span>
+    <h1 class="hero-title">数据库同步工具 Design System</h1>
+    <p class="hero-subtitle">覆盖颜色体系 · 字体层级 · 间距规则 · 基础组件四大板块，为数据源管理、同步任务、备份恢复、校验报告等高频数据密集场景提供一致的设计语言。</p>
+    <p class="hero-meta">v1.0 · 2026-10 · 暗色优先 / 明暗双模式 · 基于《数据库同步工具设计方案（最终完整版）》</p>
+  </div>
+
+  <hr class="divider">
+
+  <div class="section-head">
+    <h2 class="section-title">设计原则 Design Principles</h2>
+    <p class="section-desc">源于方案的交互约定（§6.3）：危险操作必须二次确认、时间统一本地时区、延迟数值按绿 / 黄 / 红三档着色、WS 断线全局横幅提示。</p>
+  </div>
+
+  <div class="principles-row">
+    <div class="principle-card">
+      <span class="principle-num">01 · 数据先行</span>
+      <span class="principle-title">让数据自己说话</span>
+      <span class="principle-desc">位点、SHA-256、DDL 原文、延迟秒数等关键数据始终直接可见；数字一律等宽字体，杜绝装饰干扰。</span>
+    </div>
+    <div class="principle-card">
+      <span class="principle-num">02 · 克制的工程美学</span>
+      <span class="principle-title">层级靠明度，不靠阴影</span>
+      <span class="principle-desc">深色画布上以 1px 发丝线与三级明度梯度区分层级；紫色仅用于操作与焦点，每页信号色不超过一种。</span>
+    </div>
+    <div class="principle-card">
+      <span class="principle-num">03 · 状态可见性</span>
+      <span class="principle-title">任何状态都不允许静默</span>
+      <span class="principle-desc">任务 12 种状态机状态、预检通过 / 警告 / 失败三态、WS 连接状态均有明确视觉表达；危险操作一律红色 + 二次确认。</span>
+    </div>
+    <div class="principle-card">
+      <span class="principle-num">04 · 4px 栅格秩序</span>
+      <span class="principle-title">一切间距皆有刻度</span>
+      <span class="principle-desc">间距、字号、圆角全部落在 4px 基准的刻度上；表格行高 40px、侧边栏 240px、内容区最大 1280px 保持全局节奏一致。</span>
+    </div>
+  </div>
+
+  <hr class="divider">
+
+  <div class="section-head" id="sec-tokens">
+    <h2 class="section-title">核心语义色 Semantic Colors</h2>
+    <p class="section-desc">全部颜色以 Design Token 形式入库（Semantic Color 变量集，明 / 暗双模式），组件直接引用变量而非硬编码色值。</p>
+  </div>
+
+  <div class="chips-row">
+    <div class="chip chip-accent"><span class="chip-label">Accent 操作 / 焦点
+#7C3AED</span></div>
+    <div class="chip chip-info"><span class="chip-label">Info 链路 / 数据
+#22D3EE</span></div>
+    <div class="chip chip-success"><span class="chip-label">Success 运行 / 通过
+#10B981</span></div>
+    <div class="chip chip-warning"><span class="chip-label">Warning 待决策
+#F59E0B</span></div>
+    <div class="chip chip-error"><span class="chip-label">Error 失败 / 危险
+#F43F5E</span></div>
+  </div>
+
+  <hr class="divider">
+
+  <div class="section-head">
+    <h2 class="section-title">应用示例 · 真实场景片段</h2>
+    <p class="section-desc">取自方案 §6.2 的两个高频场景：任务列表中的运行态行（延迟数值按绿 / 黄 / 红三档着色），与 DDL 待决策弹窗（等宽代码块 + 双决策按钮）。</p>
+  </div>
+
+  <div class="examples-row">
+    <div class="example-card">
+      <span class="example-caption">任务列表 · 运行态行</span>
+      <div class="task-row">
+        <span class="task-name">订单库 → 报表库</span>
+        <span class="status-pill sp-success"><span class="dot"></span>增量运行中</span>
+        <span class="spacer"></span>
+        <span class="task-position">mysql-bin.000042:1987</span>
+        <span class="task-lag-ok">2.3s</span>
+      </div>
+    </div>
+    <div class="example-card">
+      <span class="example-caption">DDL 待决策弹窗 · 片段</span>
+      <div class="ddl-title-row">
+        <span class="ddl-title">检测到 DDL 变更</span>
+        <span class="status-pill sp-warning"><span class="dot"></span>待决策</span>
+      </div>
+      <div class="code-block"><code>CREATE INDEX idx_channel ON `orders` (`channel`);</code></div>
+      <div class="btn-row">
+        <button class="btn btn-primary">目标库执行并继续</button>
+        <button class="btn btn-secondary">跳过并继续</button>
+        <span class="checkbox-hint">☐ 同类 DDL 记住选择</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════ 02 · 颜色体系 ══════════ -->
+<section class="page page-02" id="page-02">
+  <h1 class="hero-title" style="font-size: 28px;">02 · 颜色体系 Color System</h1>
+  <p class="section-desc">深色为默认模式（监控大屏场景），亮色按变量 Light 模式一键切换；所有色值均已录入 Semantic Color 变量集。层级靠三级明度梯度 + 1px 发丝线表达，禁止彩色阴影。</p>
+
+  <h2 class="section-title">中性色 · 明度梯度（暗色默认）</h2>
+  <div class="neutral-row">
+    <div class="neutral-card n-base"><span class="neutral-label dim">bg-base 页面画布
+#0A0A0B · L0</span></div>
+    <div class="neutral-card n-card"><span class="neutral-label">bg-card 卡片表面
+#141417 · L1</span></div>
+    <div class="neutral-card n-elevated"><span class="neutral-label">bg-elevated 浮层
+#18181D · L2</span></div>
+    <div class="neutral-card n-border"><span class="neutral-label">border 发丝线
+#27272A · 1px</span></div>
+    <div class="neutral-card n-strong"><span class="neutral-label">border-strong
+#3F3F46 · 悬停</span></div>
+  </div>
+
+  <h2 class="section-title">文字色 · 三级层级</h2>
+  <div class="text-row">
+    <div class="text-card">
+      <span class="text-sample-primary">主文字 Primary</span>
+      <span class="text-hex">#FAFAFA / 暗 · #090909 / 亮</span>
+      <span class="text-use">标题、任务名、关键数值</span>
+    </div>
+    <div class="text-card">
+      <span class="text-sample-secondary">次要文字 Secondary</span>
+      <span class="text-hex">#A1A1AA / 暗 · #6B6B6B / 亮</span>
+      <span class="text-use">正文、表单说明、表头</span>
+    </div>
+    <div class="text-card">
+      <span class="text-sample-tertiary">辅助文字 Tertiary</span>
+      <span class="text-hex">#71717A / 暗 · #999999 / 亮</span>
+      <span class="text-use">时间戳、标注、禁用态</span>
+    </div>
+  </div>
+
+  <h2 class="section-title">语义色 · 使用规则</h2>
+  <p class="section-desc">每行展示暗色模式的色彩样本；亮色模式色值并列标注。所有语义色组件同时录入变量集，双模式自动换算。</p>
+  <div class="semantic-list">
+    <div class="semantic-row">
+      <span class="semantic-swatch sw-accent"></span>
+      <span class="semantic-name">Accent · 操作 / 焦点</span>
+      <span class="semantic-hex">#7C3AED</span>
+      <span class="semantic-use">主按钮、焦点环、选中态、链接</span>
+      <span class="semantic-rule">禁止用于装饰</span>
+    </div>
+    <div class="semantic-row">
+      <span class="semantic-swatch sw-info"></span>
+      <span class="semantic-name">Info · 链路 / 数据</span>
+      <span class="semantic-hex">#22D3EE / 亮 #0AB5D9</span>
+      <span class="semantic-use">数据链路标识、DDL 代码块、位点高亮</span>
+      <span class="semantic-rule">与 Accent 混用</span>
+    </div>
+    <div class="semantic-row">
+      <span class="semantic-swatch sw-success"></span>
+      <span class="semantic-name">Success · 运行 / 通过</span>
+      <span class="semantic-hex">#10B981 / 亮 #059869</span>
+      <span class="semantic-use">增量运行中、预检通过、校验一致</span>
+      <span class="semantic-rule muted">——</span>
+    </div>
+    <div class="semantic-row">
+      <span class="semantic-swatch sw-warning"></span>
+      <span class="semantic-name">Warning · 待处理</span>
+      <span class="semantic-hex">#F59E0B / 亮 #C7790C</span>
+      <span class="semantic-use">DDL 待决策、延迟接近阈值、已知限制提示</span>
+      <span class="semantic-rule muted">——</span>
+    </div>
+    <div class="semantic-row">
+      <span class="semantic-swatch sw-error"></span>
+      <span class="semantic-name">Error · 失败 / 危险</span>
+      <span class="semantic-hex">#F43F5E / 亮 #D93841</span>
+      <span class="semantic-use">任务失败、熔断、危险操作按钮（清空重建 / 删除）</span>
+      <span class="semantic-rule">禁止做强调色</span>
+    </div>
+  </div>
+
+  <h2 class="section-title" id="sec-status">状态机 · 色彩映射</h2>
+  <p class="section-desc">对应方案 §10 任务状态机的 12 种状态：状态一律以「色点 + 文字」的胶囊表达，禁止仅用颜色区分（可访问性）。</p>
+  <div class="status-flow">
+    <span class="status-pill sp-success"><span class="dot"></span>增量运行中</span>
+    <span class="status-pill sp-neutral"><span class="dot"></span>已暂停</span>
+    <span class="status-pill sp-info"><span class="dot"></span>初始化中</span>
+    <span class="status-pill sp-info"><span class="dot"></span>重刷中</span>
+    <span class="status-pill sp-accent"><span class="dot"></span>备份中</span>
+    <span class="status-pill sp-neutral"><span class="dot"></span>空闲</span>
+    <span class="status-pill sp-neutral"><span class="dot"></span>草稿</span>
+    <span class="status-pill sp-warning"><span class="dot"></span>DDL 待决策</span>
+    <span class="status-pill sp-error"><span class="dot"></span>异常待处理</span>
+    <span class="status-pill sp-error"><span class="dot"></span>需重新初始化</span>
+    <span class="status-pill sp-error"><span class="dot"></span>异常</span>
+  </div>
+
+  <h2 class="section-title" id="sec-modes">明 / 暗双模式对照</h2>
+  <p class="section-desc">示例卡片全部绑定 Semantic Color 变量：左图 Dark（默认），右图通过 variableModes = Light 一键切换，无需改动任何组件。</p>
+  <div class="mode-row">
+    <div class="mode-panel">
+      <span class="mode-caption">Dark · 默认模式</span>
+      <div class="mini-card">
+        <span class="field-label">主机地址 Host</span>
+        <div class="input"><span>10.0.12.8</span></div>
+        <div class="btn-row">
+          <button class="btn btn-primary">测试连接</button>
+          <button class="btn btn-secondary">保存</button>
+        </div>
+      </div>
+    </div>
+    <div class="mode-panel scope-light">
+      <span class="mode-caption">Light · variableModes = Light</span>
+      <div class="mini-card">
+        <span class="field-label">主机地址 Host</span>
+        <div class="input"><span>10.0.12.8</span></div>
+        <div class="btn-row">
+          <button class="btn btn-primary">测试连接</button>
+          <button class="btn btn-secondary">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">数据库同步工具 · Design System v1.0 · 2026-10 · Token 与画布 Semantic Color 变量集保持同步</footer>
+
+<script>
+// 明暗主题切换：对应变量集 Dark(默认) / Light 双模式
+  const root = document.documentElement;
+  const label = document.getElementById('themeLabel');
+  const toggle = document.getElementById('themeToggle');
+  toggle.addEventListener('click', () => {
+    const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    label.textContent = next === 'dark' ? '亮色模式' : '暗色模式';
+  });
+})();
+</script>
+</body>
+</html>

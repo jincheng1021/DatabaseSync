@@ -1,0 +1,75 @@
+/* ============================================================
+   数据库同步工具 · Design System v1.0 · Design Tokens
+   来源：Ardot 画布 Semantic Color / Spacing / Radius / Font Size 变量集
+   画布：https://ardot.tencent.com/file/734622723978490
+   用法：引入本文件后，组件样式一律引用 var(--...)，禁止硬编码色值；
+         暗色为默认模式，<html data-theme="light"> 一键切换亮色。
+   ============================================================ */
+:root {
+  /* ---- Semantic Color · Dark（默认） ---- */
+  --Semantic-Color-bg-base: #0A0A0A;
+  --Semantic-Color-bg-card: #141417;
+  --Semantic-Color-bg-elevated: #17171C;
+  --Semantic-Color-border: #262629;
+  --Semantic-Color-border-strong: #404045;
+  --Semantic-Color-text-primary: #FAFAFA;
+  --Semantic-Color-text-secondary: #A1A1A6;
+  --Semantic-Color-text-tertiary: #75757A;
+  --Semantic-Color-accent: #7D3BED;
+  --Semantic-Color-accent-hover: #9952F7;
+  --Semantic-Color-info: #21D4ED;
+  --Semantic-Color-success: #0FBA82;
+  --Semantic-Color-warning: #F59E0A;
+  --Semantic-Color-error: #F5405E;
+}
+[data-theme="light"] {
+  /* ---- Semantic Color · Light ---- */
+  --Semantic-Color-bg-base: #FAFAFA;
+  --Semantic-Color-bg-card: #FFFFFF;
+  --Semantic-Color-bg-elevated: #FCFCFC;
+  --Semantic-Color-border: #E0E3E5;
+  --Semantic-Color-border-strong: #B8BABF;
+  --Semantic-Color-text-primary: #171717;
+  --Semantic-Color-text-secondary: #6B6B6B;
+  --Semantic-Color-text-tertiary: #999999;
+  --Semantic-Color-accent: #7D3BED;
+  --Semantic-Color-accent-hover: #6629ED;
+  --Semantic-Color-info: #0AB0D9;
+  --Semantic-Color-success: #059966;
+  --Semantic-Color-warning: #C97A0D;
+  --Semantic-Color-error: #D9293D;
+}
+:root {
+  /* ---- Spacing（4px 基准栅格） ---- */
+  --Spacing-space-xs: 4px;
+  --Spacing-space-1: 4px;
+  --Spacing-space-sm: 8px;
+  --Spacing-space-2: 8px;
+  --Spacing-space-md: 12px;
+  --Spacing-space-3: 12px;
+  --Spacing-space-lg: 16px;
+  --Spacing-space-4: 16px;
+  --Spacing-space-xl: 24px;
+  --Spacing-space-5: 24px;
+  --Spacing-space-2xl: 32px;
+  --Spacing-space-6: 40px;
+  --Spacing-space-10: 64px;
+
+  /* ---- Radius ---- */
+  --Radius-radius-sm: 4px;
+  --Radius-radius-md: 6px;   /* 按钮 / 输入框 / 代码块 */
+  --Radius-radius-lg: 8px;   /* 卡片 */
+  --Radius-radius-xl: 12px;  /* 浮层面板 */
+  --Radius-radius-full: 9999px; /* 胶囊 / 圆点 */
+
+  /* ---- Font Size ---- */
+  --Font-Size-font-micro: 11px;     /* 标注 / 胶囊 */
+  --Font-Size-font-caption: 12px;   /* 辅助说明 */
+  --Font-Size-font-h4: 13px;        /* 按钮文字 / 表单 */
+  --Font-Size-font-body: 14px;      /* 正文 / 表格 */
+  --Font-Size-font-mono-body: 13px; /* 等宽数据（位点/SHA/hex） */
+  --Font-Size-font-h3: 16px;        /* 卡片标题 */
+  --Font-Size-font-h2: 20px;        /* 小节标题 */
+  --Font-Size-font-h1: 28px;        /* 页标题 */
+  --Font-Size-font-display: 40px;   /* 封面主标题 */
+}

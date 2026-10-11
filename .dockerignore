@@ -1,0 +1,39 @@
+# ============================================================
+# Docker 构建上下文排除清单（context = 项目根目录）
+# 目的：上下文只保留构建必需文件，避免把 node_modules（258MB+）、
+#       本地数据库、文档等送入 docker build，显著加快构建与上传
+# ============================================================
+
+# ---- 版本与系统文件 ----
+.git
+.github
+.workbuddy
+.idea
+.vscode
+
+# ---- Python 缓存 / 本地运行数据 ----
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.log
+**/*.db
+**/*.db-wal
+**/*.db-shm
+backend/tests
+backend/.pytest_cache
+
+# ---- 前端（依赖与产物在容器内重新生成，禁止上传/参与构建）----
+frontend/node_modules
+frontend/dist
+frontend/tsconfig.tsbuildinfo
+
+# ---- 与镜像无关的文档与辅助目录 ----
+docs
+design-system-app
+deploy/systemd
+*.md
+
+# ---- 例外：构建清单必须保留 ----
+!frontend/package.json
+!frontend/package-lock.json
+!backend/requirements.txt

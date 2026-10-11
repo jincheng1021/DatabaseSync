@@ -1,0 +1,13 @@
+# 依赖版本锁定：以当前环境已安装版本为准（用户要求：优先已装版本，缺项取最新稳定版）
+fastapi==0.128.8
+uvicorn[standard]==0.52.4
+aiomysql==0.3.2
+PyMySQL==1.2.3
+cryptography==50.0.1
+argon2-cffi==25.1.0
+APScheduler==3.11.3
+mysql-replication==1.0.17
+python-multipart==0.0.32
+# ---- 测试 ----
+pytest==9.1.1
+httpx==0.28.1

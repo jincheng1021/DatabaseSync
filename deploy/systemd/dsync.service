@@ -1,0 +1,28 @@
+[Unit]
+Description=Database Sync Tool (dsync) - FastAPI backend + static frontend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 部署目录按实际路径调整（默认 /opt/dsync，backend venv 位于 /opt/dsync/venv）
+WorkingDirectory=/opt/dsync/backend
+Environment=DSYNC_DATA_DIR=/opt/dsync/data
+Environment=DSYNC_LOG_DIR=/opt/dsync/logs
+Environment=DSYNC_BACKUP_DIR=/opt/dsync/backups
+Environment=DSYNC_FRONTEND_DIST=/opt/dsync/frontend/dist
+ExecStart=/opt/dsync/venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+
+# 安全加固（§12）
+User=dsync
+Group=dsync
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/dsync/data /opt/dsync/logs /opt/dsync/backups
+
+[Install]
+WantedBy=multi-user.target

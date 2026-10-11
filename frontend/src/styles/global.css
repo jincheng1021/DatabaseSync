@@ -1,0 +1,65 @@
+/* 全局样式：全部引用 tokens.css 的 var(--...)，禁止硬编码色值 */
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Noto Sans SC', -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: var(--Font-Size-font-body);
+  color: var(--Semantic-Color-text-primary);
+  background: var(--Semantic-Color-bg-base);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 等宽数据：位点 / SHA / 数字 / 代码 */
+.mono {
+  font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+  font-size: var(--Font-Size-font-mono-body);
+}
+
+/* 状态胶囊：色点 + 文字（禁止仅用颜色区分） */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--Spacing-space-sm);
+  padding: 2px 10px;
+  border-radius: var(--Radius-radius-full);
+  font-size: var(--Font-Size-font-micro);
+  border: 1px solid var(--Semantic-Color-border);
+  background: var(--Semantic-Color-bg-card);
+}
+.status-pill .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--Radius-radius-full);
+}
+.status-pill.pass .dot { background: var(--Semantic-Color-success); }
+.status-pill.warn .dot { background: var(--Semantic-Color-warning); }
+.status-pill.fail .dot { background: var(--Semantic-Color-error); }
+.status-pill.info .dot { background: var(--Semantic-Color-info); }
+
+/* 页面容器 */
+.page {
+  padding: var(--Spacing-space-2xl);
+  max-width: 1280px;
+}
+.page-title {
+  font-size: var(--Font-Size-font-h1);
+  font-weight: 600;
+  margin: 0 0 var(--Spacing-space-xl);
+}
+
+/* 卡片 */
+.card {
+  background: var(--Semantic-Color-bg-card);
+  border: 1px solid var(--Semantic-Color-border);
+  border-radius: var(--Radius-radius-lg);
+  padding: var(--Spacing-space-xl);
+}
+
+/* 链路/数据强调色 */
+.data-link { color: var(--Semantic-Color-info); }

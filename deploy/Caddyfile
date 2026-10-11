@@ -1,0 +1,11 @@
+# HTTPS 反向代理（自签证书，与 docker-compose.yml --profile https 配套）
+# 证书路径挂载为 /certs/dsync.crt 与 /certs/dsync.key
+:8443 {
+	tls /certs/dsync.crt /certs/dsync.key
+	reverse_proxy dsync:8080
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+	}
+}

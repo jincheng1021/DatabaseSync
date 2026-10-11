@@ -1,0 +1,37 @@
+# ============================================================
+# 数据库同步工具（sjktb）.gitignore
+# 只提交源码、配置与文档，运行时产物一律不入库
+# ============================================================
+
+# ---- 会话/工具本地数据 ----
+.workbuddy/
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# ---- 运行时数据（本地生成）----
+backend/data/
+backend/logs/
+backend/backups/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.log.*
+*.gz
+
+# ---- 前端 ----
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# ---- IDE / 系统 ----
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
