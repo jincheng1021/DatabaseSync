@@ -13,6 +13,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+docs/mdx/
 
 # ---- 运行时数据（本地生成）----
 backend/data/
