@@ -191,6 +191,16 @@ def test_copy_one_reconnects_and_copies_all(copy_env, monkeypatch):
     monkeypatch.setattr(fe, "get_primary_key", lambda conn, schema, table: ["id"])
     monkeypatch.setattr(fe, "fetch_all", lambda conn, sql, args=():
                         [{"column_name": "id"}, {"column_name": "v"}])
+    # P0-3/P0-4 修复回归：开拷前结构预检的元数据查询打桩
+    # （预检通过：目标表在、列齐、主键一致、无唯一索引）
+    monkeypatch.setattr(fe, "fetch_one", lambda conn, sql, args=(): {"n": 1})
+
+    def fake_all_lc(conn, sql, args=()):
+        if "information_schema.columns" in sql:
+            return [{"tn": "t1", "cn": "id"}, {"tn": "t1", "cn": "v"}]
+        return []
+
+    monkeypatch.setattr(fe, "fetch_all_lc", fake_all_lc)
     monkeypatch.setattr(engine, "_show_create", lambda conn, table: "CREATE TABLE t1 (id int)")
 
     errors: list[str] = []

@@ -563,7 +563,7 @@ const queuePct = computed(() => {
 
       <!-- M4 页签：调度 / 策略 / 表映射 -->
       <n-tab-pane name="schedule" tab="调度">
-        <ScheduleTab :task-id="taskId" :task-state="state" />
+        <ScheduleTab :task-id="taskId" :task-state="state" :task="task" />
       </n-tab-pane>
       <n-tab-pane name="policy" tab="策略">
         <PolicyTab :task-id="taskId" :task="task" @saved="load" />

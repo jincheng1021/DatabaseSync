@@ -23,12 +23,15 @@ COPY frontend/ ./
 RUN node node_modules/vite/bin/vite.js build
 
 # ---------- Stage 2：运行镜像 ----------
-FROM python:3.11-slim AS runtime
+# Python 3.12：与本地测试 venv（3.13）及 requirements 锁定版本兼容；APScheduler==3.11.3 是包版本，与 Python 无关
+FROM python:3.12-slim AS runtime
 
 # pip 换源（默认清华源，海外构建机可覆盖为官方源）
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 # 安全基线：非 root 运行；固定 uid/gid=999（与部署手册 chown 999:999 指引对齐）
+# 注意：/home/dsync 是【容器内】运行账户的家目录（仅 useradd 记录用，应用不读写它），
+#       与宿主机部署目录 /opt/dsync 无关——容器内不存在 /opt/dsync，勿混淆
 RUN groupadd -r -g 999 dsync && useradd -r -u 999 -g dsync -m -d /home/dsync dsync
 
 # 时区数据：调度器 cron 依赖容器本地时间，缺 tzdata 时 TZ 不生效

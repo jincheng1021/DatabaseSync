@@ -1,7 +1,8 @@
 <script setup lang="ts">
 /**
  * 任务详情 · 调度页签（T4.6 / §6.2 页面 4「调度」页签）：
- * schedule 列表 + cron 图形模板/手输双模式 + 时区选择 + 未来 5 次触发预览（E11）。
+ * schedule 列表 + 新建/编辑抽屉（周期配置复用 CronCycleConfig 共享组件）
+ * + 全量重刷参数（表勾选集/安全网/孤儿清理）。
  */
 import { computed, h, onMounted, ref } from 'vue'
 import {
@@ -10,11 +11,12 @@ import {
 } from 'naive-ui'
 import type { DataTableColumns } from 'naive-ui'
 import {
-  ACTION_LABELS, scheduleApi, type Schedule, type ScheduleAction,
+  ACTION_LABELS, scheduleApi, type Schedule, type ScheduleAction, type SyncTask,
 } from '../api'
 import { errMsg } from '../api/client'
+import CronCycleConfig from './CronCycleConfig.vue'
 
-const props = defineProps<{ taskId: number; taskState: string }>()
+const props = defineProps<{ taskId: number; taskState: string; task?: SyncTask | null }>()
 const message = useMessage()
 const dialog = useDialog()
 
@@ -23,39 +25,36 @@ const loading = ref(false)
 const showDrawer = ref(false)
 const editing = ref<Schedule | null>(null)
 const busy = ref(false)
+const cronCycleRef = ref<InstanceType<typeof CronCycleConfig> | null>(null)
 
 const ACTION_OPTIONS = (Object.keys(ACTION_LABELS) as ScheduleAction[])
   .map((k) => ({ label: ACTION_LABELS[k], value: k }))
 
-const TZ_OPTIONS = ['Asia/Shanghai', 'UTC', 'Asia/Tokyo', 'Asia/Singapore', 'Europe/London',
-  'America/New_York'].map((t) => ({ label: t, value: t }))
-
-const form = ref({
+const DEFAULT_FORM = () => ({
   name: '',
   action: 'verify' as ScheduleAction,
   cron: '0 3 * * *',
-  cronMode: 'daily',
   timezone: 'Asia/Shanghai',
   enabled: true,
   overlap_policy: 'skip',
   misfire_policy: 'skip',
   method: 'checksum',
+  resyncTables: [] as string[],
+  safetyNet: true,
+  orphanCleanup: true,
 })
 
-// cron 图形模板：常用周期一键填充（双模式）
-const CRON_TEMPLATES = [
-  { label: '每天 03:00', value: 'daily', cron: '0 3 * * *' },
-  { label: '每天 02:00 / 14:00', value: 'twice', cron: '0 2,14 * * *' },
-  { label: '每小时整点', value: 'hourly', cron: '0 * * * *' },
-  { label: '每 30 分钟', value: 'halfhour', cron: '*/30 * * * *' },
-  { label: '每周一 02:00', value: 'weekly', cron: '0 2 * * 1' },
-  { label: '每月 1 日 02:00', value: 'monthly', cron: '0 2 1 * *' },
-]
+const form = ref(DEFAULT_FORM())
 
-const preview = ref<string[]>([])
-const cronError = ref('')
-const previewTz = computed(() => form.value.timezone)
+// ---------- 全量重刷参数（表勾选集来自任务映射） ----------
+const taskTableOptions = computed(() => {
+  const mp = props.task?.mapping
+  return mp?.scope === 'selected' && mp.tables?.length
+    ? mp.tables.map((t) => ({ label: t, value: t }))
+    : []
+})
 
+// ---------- 列表加载 ----------
 async function load() {
   loading.value = true
   try {
@@ -68,73 +67,58 @@ async function load() {
 }
 onMounted(load)
 
-async function refreshPreview() {
-  cronError.value = ''
-  if (!form.value.cron.trim()) {
-    preview.value = []
-    return
-  }
-  try {
-    preview.value = (await scheduleApi.preview(form.value.cron, form.value.timezone, 5)).next
-  } catch (e) {
-    preview.value = []
-    cronError.value = errMsg(e)
-  }
-}
-
-function onTemplateChange(v: string) {
-  const t = CRON_TEMPLATES.find((x) => x.value === v)
-  if (t) {
-    form.value.cron = t.cron
-    void refreshPreview()
-  }
-}
-
-function onCronInput() {
-  form.value.cronMode = 'manual'
-  void refreshPreview()
-}
-
 function openCreate() {
   editing.value = null
-  form.value = { ...form.value, name: '', action: 'verify', cron: '0 3 * * *',
-    cronMode: 'daily', timezone: 'Asia/Shanghai', enabled: true,
-    overlap_policy: 'skip', misfire_policy: 'skip', method: 'checksum' }
-  preview.value = []
-  cronError.value = ''
+  form.value = DEFAULT_FORM()
   showDrawer.value = true
 }
 
 function openEdit(s: Schedule) {
+  const ap = (s.action_params ?? {}) as {
+    method?: string; tables?: string[]; safety_net?: boolean; orphan_cleanup?: boolean
+  }
   editing.value = s
-  form.value = { ...form.value, name: s.name, action: s.action, cron: s.cron,
-    cronMode: 'manual', timezone: s.timezone, enabled: s.enabled,
-    overlap_policy: s.overlap_policy, misfire_policy: s.misfire_policy,
-    method: (s.action_params as { method?: string } | null)?.method || 'checksum' }
-  preview.value = []
-  cronError.value = ''
+  form.value = {
+    ...DEFAULT_FORM(),
+    name: s.name, action: s.action, cron: s.cron, timezone: s.timezone,
+    enabled: s.enabled, overlap_policy: s.overlap_policy, misfire_policy: s.misfire_policy,
+    method: ap.method || 'checksum',
+    resyncTables: ap.tables ?? [],
+    safetyNet: ap.safety_net ?? true,
+    orphanCleanup: ap.orphan_cleanup ?? true,
+  }
   showDrawer.value = true
-  void refreshPreview()
 }
 
 async function save() {
-  if (!form.value.name.trim()) {
+  const f = form.value
+  if (!f.name.trim()) {
     message.warning('请填写计划名称')
     return
   }
-  cronError.value = ''
-  await refreshPreview()
-  if (cronError.value) {
+  const localErr = cronCycleRef.value?.validate()
+  if (localErr) {
+    message.warning(localErr)
+    return
+  }
+  await cronCycleRef.value?.refreshPreview()
+  if (cronCycleRef.value?.cronError) {
     message.warning('cron 表达式不合法，请修正后再保存')
     return
+  }
+  let action_params: Record<string, unknown> = {}
+  if (f.action === 'verify') action_params = { method: f.method }
+  else if (f.action === 'full_resync') {
+    action_params = { safety_net: f.safetyNet, orphan_cleanup: f.orphanCleanup }
+    if (f.resyncTables.length) action_params.tables = f.resyncTables
   }
   busy.value = true
   try {
     const body = {
-      name: form.value.name.trim(), action: form.value.action, cron: form.value.cron,
-      timezone: form.value.timezone, enabled: form.value.enabled,
-      overlap_policy: form.value.overlap_policy, misfire_policy: form.value.misfire_policy,
-      action_params: form.value.action === 'verify' ? { method: form.value.method } : {},
+      name: f.name.trim(), action: f.action, cron: f.cron,
+      timezone: f.timezone, enabled: f.enabled,
+      overlap_policy: f.overlap_policy, misfire_policy: f.misfire_policy,
+      action_params,
     }
     if (editing.value) await scheduleApi.update(editing.value.id, body)
     else await scheduleApi.create(props.taskId, body)
@@ -248,27 +232,21 @@ const columnsFinal: DataTableColumns<Schedule> = [
               <n-radio-button value="row_count">行数比对</n-radio-button>
             </n-radio-group>
           </n-form-item>
-          <n-form-item label="cron 周期（图形模板 / 手输双模式）">
-            <div style="width: 100%; display: flex; gap: 8px; flex-direction: column">
-              <n-select :value="form.cronMode" :options="CRON_TEMPLATES"
-                placeholder="选择常用周期…" @update:value="onTemplateChange" />
-              <n-input :value="form.cron" class="mono" placeholder="分 时 日 月 周，如 0 3 * * *"
-                @update:value="onCronInput" />
-            </div>
-          </n-form-item>
-          <n-form-item label="时区">
-            <n-select v-model:value="form.timezone" :options="TZ_OPTIONS" tag filterable
-              @update:value="refreshPreview" />
-          </n-form-item>
-          <n-form-item label="未来 5 次触发预览">
-            <div class="mono" style="font-size: var(--Font-Size-font-caption); line-height: 1.8">
-              <div v-for="(p, i) in preview" :key="i"
-                style="color: var(--Semantic-Color-info)">{{ p.replace('T', ' ') }}</div>
-              <div v-if="cronError" style="color: var(--Semantic-Color-error)">{{ cronError }}</div>
-              <div v-if="!preview.length && !cronError" style="color: var(--Semantic-Color-text-tertiary)">
-                输入合法 cron 后自动计算…</div>
-            </div>
-          </n-form-item>
+          <template v-if="form.action === 'full_resync'">
+            <n-form-item label="重刷表范围（不选 = 全部表）">
+              <n-select v-model:value="form.resyncTables" multiple clearable
+                :options="taskTableOptions" :disabled="!taskTableOptions.length"
+                placeholder="默认重刷任务映射中的全部表" />
+            </n-form-item>
+            <n-form-item label="安全网（重刷前自动备份）">
+              <n-switch v-model:value="form.safetyNet" />
+            </n-form-item>
+            <n-form-item label="孤儿行清理（重刷后清理目标多余行）">
+              <n-switch v-model:value="form.orphanCleanup" />
+            </n-form-item>
+          </template>
+          <CronCycleConfig ref="cronCycleRef" v-model:cron="form.cron"
+            v-model:timezone="form.timezone" />
           <n-form-item label="并发策略（前次未完成时）">
             <n-radio-group v-model:value="form.overlap_policy">
               <n-radio-button value="skip">跳过并记录</n-radio-button>

@@ -18,6 +18,9 @@ class RepairReq(BaseModel):
     tables: list[str] | None = None
     pks: list[list] | None = Field(default=None,
                                    description="仅修复指定主键（默认全部差异行）")
+    full_tables: list[str] | None = Field(default=None,
+                                          description="指定表整表对账覆盖（不受报告 diff 条数上限约束；"
+                                                      "行过滤子集表仍跳过增删类修复）")
 
 
 @router.post("/tasks/{task_id}/verify", status_code=201)
@@ -53,8 +56,10 @@ def get_verify_result(vid: int, request: Request, detail: bool = False,
 @router.post("/verify-results/{vid}/repair")
 def repair(vid: int, body: RepairReq, request: Request,
            actor: dict = Depends(get_current_actor)):
-    """以源库覆盖修复选中差异（默认不自动修复）。"""
-    result = request.app.state.verify_service.repair(vid, tables=body.tables, pks=body.pks)
+    """以源库覆盖修复选中差异（默认不自动修复）。支持复合主键。"""
+    result = request.app.state.verify_service.repair(vid, tables=body.tables,
+                                                     pks=body.pks,
+                                                     full_tables=body.full_tables)
     request.app.state.audit.record(actor["username"], "verify.repair", ip=actor["ip"],
                                    object_type="verify_result", object_id=vid, after=result)
     return result

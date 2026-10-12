@@ -9,7 +9,7 @@
 | 项 | 原方案 | 1Panel 适配后 | 原因 |
 | --- | --- | --- | --- |
 | HTTPS 反代 | Caddy 容器（https profile） | **移除**，改用 1Panel「网站 → 反向代理 + 证书」 | 1Panel 自带 OpenResty 与证书申请/续期，重复部署徒增排障面 |
-| Docker 网络 | 默认网络（随机名） | 显式命名 `dsync-net` | OpenResty 加入后可 `proxy_pass http://dsync:8080` 直连容器，8080 无需对公网开放 |
+| Docker 网络 | 默认网络（随机名） | 加入 1Panel 默认网络 `1panel-network`（external） | OpenResty 本就在该网络，反代可直接 `proxy_pass http://dsync:8080` 直连容器，8080 无需对公网开放，且无需改动 OpenResty |
 | 时区 | 容器默认 UTC | 镜像装 tzdata + `TZ=Asia/Shanghai` | 调度器 cron 按本地时间触发，UTC 会让计划任务整体偏移 8 小时 |
 | 容器日志 | 未限制 | json-file 10MB × 3 轮转 | 防止 stdout 日志撑爆磁盘（1Panel 服务器常年在线） |
 | 构建源 | npmjs / PyPI 官方源 | 默认 npmmirror / 清华源（.env 可覆盖） | 国内服务器构建提速数倍 |
@@ -105,6 +105,8 @@ EOF
 4. 路径选择：`/opt/dsync/deploy`；
 5. 等待状态变为「已启动」。首次会自动构建镜像（拉取 node/python 基础镜像 + npm/pip 安装，约 3~10 分钟，取决于服务器带宽），可在 1Panel「容器 → 镜像」看到 `dsync:latest`。
 
+> ⚠️ 若创建编排报「拉取镜像超时」：compose 已声明 `pull_policy: build`（只本地构建、不拉取），正常不会再出现；若 1Panel 版本较旧不识别该字段，改为**先在终端构建再建编排**：`cd /opt/dsync/deploy && docker compose build`，成功后再到界面创建编排。基础镜像（node:22-alpine / python:3.12-slim）拉取被墙时需在 1Panel → 容器 → 配置 → 镜像加速 添加加速地址。
+
 > 编排创建失败排查：1Panel → 容器 → 编排 → 点进 `dsync` 查看日志；常见原因是 `.dockerignore` 未上传（构建极慢）或第 4 节目录未授权（容器秒退）。
 
 ---
@@ -146,7 +148,7 @@ curl -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/
 | 方案 | 代理地址 | 前提 |
 | --- | --- | --- |
 | **A（推荐，最简单）** | `http://服务器内网IP:8080`（如 `http://192.168.1.10:8080`） | 无，8080 只要在内网可达即可 |
-| B（更安全，容器直连） | `http://dsync:8080` | OpenResty 容器加入 `dsync-net` 网络（见 7.3） |
+| B（更安全，容器直连） | `http://dsync:8080` | dsync 已加入 `1panel-network`（compose 默认已配置，核验见 7.3） |
 
 4. 创建后进入网站设置确认代理生效。
 
@@ -164,25 +166,23 @@ proxy_send_timeout 3600s;
 
 （1Panel 反代模板一般自带 Upgrade 头，重点核对 `proxy_read_timeout`——长连接默认 60s 断开会导致前端频繁重连。）
 
-### 7.3（方案 B）OpenResty 加入 dsync-net
+### 7.3（方案 B）核验容器网络互通
 
-1Panel → 容器 → 容器 → 找到 `1Panel-openresty` 容器 → 若为编排创建，在其 compose 里给 openresty 服务追加：
+compose 已声明加入 1Panel 默认网络 `1panel-network`（external，1Panel 安装时自动创建，OpenResty 就在其中），**无需改动 OpenResty**。编排启动后在 1Panel 终端核验：
 
-```yaml
-    networks:
-      - 1panel-network
-      - dsync-net
+```bash
+# 1. 确认 dsync 已在网络内（应能看到 dsync 容器）
+docker network inspect 1panel-network --format '{{range .Containers}}{{.Name}} {{end}}'
+#    预期输出包含：1Panel-openresty ... dsync
 
-networks:
-  1panel-network:
-    external: true
-    name: 1panel-network
-  dsync-net:
-    external: true
-    name: dsync-net
+# 2. 从 OpenResty 容器内测试连通
+docker exec 1Panel-openresty curl -s -o /dev/null -w "%{http_code}\n" http://dsync:8080/api/health
+#    预期输出：200
 ```
 
-然后重建 openresty 容器。之后站点代理地址填 `http://dsync:8080`，同时把 `.env` 中 `DSYNC_BIND` 改为 `127.0.0.1` 重建编排，8080 即完全不对外暴露。
+核验通过后，站点代理地址填 `http://dsync:8080`，同时把 `.env` 中 `DSYNC_BIND` 改为 `127.0.0.1` 并重建编排，8080 即完全不对外暴露。
+
+> ⚠️ 若编排启动报 `network 1panel-network not found`：说明该网络不存在（非 1Panel 安装的 OpenResty，或网络被删）。处理：`docker network create 1panel-network` 后重启编排，并把 OpenResty 容器也加入该网络；或在 compose 中改回自定义网络并按原方式让 OpenResty 加入。
 
 ### 7.4 HTTPS 证书
 
@@ -256,7 +256,13 @@ docker compose -f /opt/dsync/deploy/docker-compose.yml up -d
 | 容器启动秒退，日志 Permission denied | 第 4 节 `chown -R 999:999 data backups logs` 未执行 |
 | 调度计划没按设定时间触发 | 时区问题，确认镜像 TZ 生效：`docker exec dsync date` 应为 CST（+0800） |
 | 反代后告警/运行日志不实时推送 | 反代未开 WebSocket（§7.2）或 `proxy_read_timeout` 过短 |
-| 反代 502 | 代理地址写错（方案 B 需 OpenResty 已加入 dsync-net）；容器 unhealthy 时也会 502 |
+| 反代 502 | 代理地址写错（方案 B 先按 §7.3 核验 dsync 与 OpenResty 在同一网络）；容器 unhealthy 时也会 502 |
+| 编排启动报 network 1panel-network not found | 该网络不存在（见 §7.3 末尾说明）：`docker network create 1panel-network` 后重启编排 |
 | 前端能开但登录后接口报错 | bootstrap 未做或做了两次；用 §6 步骤 3 核对（重复返回 409 为正常） |
+| 构建报 EBADPLATFORM @esbuild/win32-x64 | 前端依赖清单被加入了带 win32 平台标记的包（Linux 容器内 npm ci 校验拒绝）。已修复：`frontend/package.json` 不应含 `@esbuild/win32-x64`——esbuild 会经自身 optionalDependencies 自动选择平台二进制。若再现，删除该依赖并 `npm install --package-lock-only` 重建 lockfile 后重新上传 |
+| 构建报 COPY failed: frontend/package.json not found in build context | 构建上下文选错了目录，或文件不在位。排查：`ls /opt/dsync/frontend/package.json` 与 `/opt/dsync/.dockerignore` 必须存在；compose 的 `context: ..` 要求 frontend/backend 是 `/opt/dsync` 的直接子级。**构建请用终端 `cd /opt/dsync/deploy && docker compose build`，不要用 1Panel「手动构建镜像」对话框**（其上下文目录易选错；若手选，须选 `/opt/dsync`、Dockerfile 填 `deploy/Dockerfile`） |
+| 创建编排报「拉取镜像超时」 | 1Panel 建编排时先从 Docker Hub 拉 `dsync:latest`（它是私有镜像，Hub 上不存在，且被墙 → 超时）。`pull_policy: build` 只约束 compose，管不住 1Panel 自己的预拉步骤——**正确顺序：先终端构建镜像，再创建编排**：① `cd /opt/dsync/deploy && docker compose build`；② `docker images \| grep dsync` 确认镜像存在；③ 回 1Panel 创建编排（镜像在本地即跳过拉取）。若仍卡拉取，可完全绕开编排界面：终端 `docker compose up -d` 直接启动，1Panel「容器」列表照常可见可管理，网站反代不受影响 |
+| 1Panel 界面点重建报「请求超时」 | 界面按钮同步等待构建，首次构建（3~10 分钟）必超时。**属正常现象**，改在 1Panel 终端/SSH 执行：`cd /opt/dsync/deploy && docker compose build && docker compose up -d`，等待命令自然结束即可 |
+| 日志出现 Get https://registry-1.docker.io 连接被重置 | Docker Hub 拉取基础镜像被墙（node:22-alpine / python:3.12-slim）。1Panel → 容器 → 配置 → 增加「镜像加速」地址后重试；本地已有缓存时该报错不致命（会自动转为本地构建） |
 | 构建极慢/超时 | `.dockerignore` 未上传到 `/opt/dsync/`（上下文塞进了 node_modules）；或镜像源被墙，在 `.env` 覆盖 `NPM_REGISTRY`/`PIP_INDEX_URL` |
 | 误删 metadata.db | 全自动重建库，但管理员需重新 bootstrap、业务配置全部重录——先读《部署手册》§6，核心是**平时做好 §10 备份** |

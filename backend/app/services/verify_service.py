@@ -5,8 +5,12 @@
   逐行 diff（表/主键/差异列/两端值；敏感列脱敏后存 detail_json）。
 - 会话统一（硬性项）：两端连接统一字符集（按源库连接配置）与时区（取源库 time_zone），
   规避校验误报。
+- 口径收窄（T4.5）：行过滤子集表按 row_filters 谓词收窄两端比对范围（predicate_to_sql，
+  语义与 cdc_transform.eval_predicate 对齐），被过滤行不再构成误报；谓词无法转 SQL 时
+  降级全表口径并在报告 warnings 标注。tables_total 在线程解析表清单后回填（创建时清单未定）。
 - 修复：「以源库覆盖修复选中差异」——差异行按源库当前值 REPLACE 写入目标库（复用幂等写
-  语义）；target_extra（目标有源无）行删除，行过滤子集表禁用此类修复。
+  语义）；target_extra（目标有源无）行删除，行过滤子集表禁用此类修复；支持单列与复合主键；
+  full_tables 指定表走整表对账覆盖（不受报告 diff 条数上限约束）。
 - 全量/重刷成功后自动行数校验（trigger=auto）；不一致率超阈值 → 告警。
 """
 from __future__ import annotations
@@ -23,6 +27,7 @@ from app.core.progress import ProgressTracker
 from app.core.ws_broadcaster import emit_from_thread
 from app.models.m2_repository import RunRepository, TaskRepository
 from app.models.m4_repository import VerifyResultRepository
+from app.services.cdc_transform import PredicateError, predicate_to_sql
 from app.services.full_engine import MappingResolver, get_primary_key, list_source_tables
 from app.services.mysql_client import MySQLTarget, fetch_all, fetch_one, open_connection
 
@@ -173,14 +178,33 @@ class VerifyService:
                 mapping = task["mapping"] or {}
                 chunk_rows = int(self._p("checksum_chunk_rows", DEFAULT_CHUNK_ROWS))
                 excluded_all = mapping.get("column_filter") or {}
+                # 校验口径按 row_filters 收窄（子集同步表只对被同步子集比对，
+                # 被过滤行不再以 target_missing/target_extra 误报）；
+                # 谓词无法转 SQL 时降级为全表口径并记录告警
+                row_filters = mapping.get("row_filters") or {}
+                preds: dict[str, tuple[str, list]] = {}
+                for t in use_tables:
+                    p = row_filters.get(t)
+                    if not p:
+                        continue
+                    try:
+                        preds[t] = predicate_to_sql(p)
+                    except PredicateError as pe:
+                        detail["warnings"].append(
+                            f"{t}: 行过滤谓词无法转 SQL（{pe}），校验按全表口径，"
+                            f"修复侧仍会跳过该表增删类修复")
+                self.verify_repo.set_tables_total(vid, len(use_tables))
                 for table in use_tables:
+                    pred = preds.get(table)
                     if method == "row_count":
-                        tr = self._verify_row_count(src_conn, tgt_conn, resolver, table)
+                        tr = self._verify_row_count(src_conn, tgt_conn, resolver, table,
+                                                    pred=pred)
                     else:
                         tr = self._verify_checksum(src_conn, tgt_conn, resolver, table,
                                                    chunk_rows,
                                                    set(excluded_all.get(table) or []),
-                                                   no_pk_degraded=self._is_degraded(mapping, table))
+                                                   no_pk_degraded=self._is_degraded(mapping, table),
+                                                   pred=pred)
                     detail["tables"][table] = tr
                     summary["tables_checked"] += 1
                     if tr["status"] != "match":
@@ -262,22 +286,33 @@ class VerifyService:
 
     # ---- 行数校验 ----
     def _verify_row_count(self, src_conn, tgt_conn, resolver: MappingResolver,
-                          table: str) -> dict:
-        s = int(fetch_one(src_conn, f"SELECT COUNT(*) AS n FROM `{resolver.source_schema}`.`{table}`")["n"])
-        t = int(fetch_one(tgt_conn, f"SELECT COUNT(*) AS n FROM `{resolver.target_schema}`.`{resolver.target_name(table)}`")["n"])
+                          table: str, pred: tuple[str, list] | None = None) -> dict:
+        psql, pargs = pred if pred else (None, [])
+        w = f" WHERE {psql}" if psql else ""
+        s = int(fetch_one(src_conn,
+                          f"SELECT COUNT(*) AS n FROM `{resolver.source_schema}`.`{table}`{w}",
+                          tuple(pargs))["n"])
+        t = int(fetch_one(tgt_conn,
+                          f"SELECT COUNT(*) AS n FROM `{resolver.target_schema}`.`{resolver.target_name(table)}`{w}",
+                          tuple(pargs))["n"])
         return {"status": "match" if s == t else "mismatch", "src_count": s, "tgt_count": t,
-                "diff_count": abs(s - t) if s != t else 0}
+                "diff_count": abs(s - t) if s != t else 0,
+                **({"filtered": True} if psql else {})}
 
     # ---- checksum 校验 ----
     def _verify_checksum(self, src_conn, tgt_conn, resolver: MappingResolver, table: str,
                          chunk_rows: int, excluded: set[str], *,
-                         no_pk_degraded: bool = False) -> dict:
+                         no_pk_degraded: bool = False,
+                         pred: tuple[str, list] | None = None) -> dict:
         tgt_table = resolver.target_name(table)
         pk = get_primary_key(src_conn, resolver.source_schema, table)
         cols = self._compare_cols(src_conn, resolver.source_schema, table, pk, excluded)
         collist = ", ".join(f"`{c}`" for c in cols)
+        psql, pargs = pred if pred else (None, [])
         result: dict = {"status": "match", "chunks": 0, "mismatch_chunks": 0,
                         "diff_count": 0, "diffs": [], "src_count": 0, "tgt_count": 0}
+        if psql:
+            result["filtered"] = True
 
         # ---- 无主键降级比对（T4.5）：整表 ORDER BY 全列聚合 CRC（无法定位行级，且物理删除不可捕获） ----
         if not pk or no_pk_degraded:
@@ -285,12 +320,13 @@ class VerifyService:
                 result["warning"] = ("无主键表降级比对：整表聚合 CRC（无法行级定位；"
                                      "物理删除无法捕获，建议补主键走 CDC）")
             order = ", ".join(f"`{c}`" for c in cols)
-            s_crc = self._agg_crc(src_conn, f"SELECT {collist} FROM `{resolver.source_schema}`.`{table}` ORDER BY {order}")
-            t_crc = self._agg_crc(tgt_conn, f"SELECT {collist} FROM `{resolver.target_schema}`.`{tgt_table}` ORDER BY {order}")
+            w = f" WHERE {psql}" if psql else ""
+            s_crc = self._agg_crc(src_conn, f"SELECT {collist} FROM `{resolver.source_schema}`.`{table}`{w} ORDER BY {order}", tuple(pargs))
+            t_crc = self._agg_crc(tgt_conn, f"SELECT {collist} FROM `{resolver.target_schema}`.`{tgt_table}`{w} ORDER BY {order}", tuple(pargs))
             result["src_crc"] = s_crc
             result["tgt_crc"] = t_crc
-            s_cnt = int(fetch_one(src_conn, f"SELECT COUNT(*) AS n FROM `{resolver.source_schema}`.`{table}`")["n"])
-            t_cnt = int(fetch_one(tgt_conn, f"SELECT COUNT(*) AS n FROM `{resolver.target_schema}`.`{tgt_table}`")["n"])
+            s_cnt = int(fetch_one(src_conn, f"SELECT COUNT(*) AS n FROM `{resolver.source_schema}`.`{table}`{w}", tuple(pargs))["n"])
+            t_cnt = int(fetch_one(tgt_conn, f"SELECT COUNT(*) AS n FROM `{resolver.target_schema}`.`{tgt_table}`{w}", tuple(pargs))["n"])
             result["src_count"], result["tgt_count"] = s_cnt, t_cnt
             if s_crc != t_crc or s_cnt != t_cnt:
                 result.update(status="mismatch", diff_count=max(s_cnt, t_cnt))
@@ -306,8 +342,16 @@ class VerifyService:
 
         last_vals: tuple | None = None
         while True:
-            pred, args = (self._lexi_gt(pk, last_vals) if last_vals is not None else ("", []))
-            where = f" WHERE {pred}" if pred else ""
+            # 行过滤收窄谓词（如有）+ 字典序 keyset 下界，AND 组合（均为绑定参数）
+            conds: list[str] = []
+            args: list = list(pargs)
+            if psql:
+                conds.append(f"({psql})")
+            if last_vals is not None:
+                lp, la = self._lexi_gt(pk, last_vals)
+                conds.append(f"({lp})")
+                args.extend(la)
+            where = f" WHERE {' AND '.join(conds)}" if conds else ""
             sql = (f"SELECT {collist} FROM `{resolver.source_schema}`.`{table}`{where} "
                    f"ORDER BY {pkc_list} LIMIT {int(chunk_rows)}")
             s_rows = fetch_all(src_conn, sql, tuple(args))
@@ -316,7 +360,9 @@ class VerifyService:
             boundary_vals = tuple(s_rows[-1][c] for c in pk)
             # 目标端同口径半开区间：(上一块边界, 本块边界]
             where_parts: list[str] = []
-            t_args: list = []
+            t_args: list = list(pargs)
+            if psql:
+                where_parts.append(f"({psql})")
             if last_vals is not None:
                 p, a = self._lexi_gt(pk, last_vals)
                 where_parts.append(f"({p})")
@@ -342,8 +388,15 @@ class VerifyService:
                 result["diff_count"] += total
                 result["diffs"].extend(diffs[: max(0, 100 - len(result["diffs"]))])
         # 尾块：源库遍历完后，目标库残留 > 末块边界的行 = 目标多余（孤儿）
-        pred_lo, lo_args = (self._lexi_gt(pk, last_vals) if last_vals is not None else ("", []))
-        tail_where = f" WHERE {pred_lo}" if pred_lo else ""
+        tail_conds: list[str] = []
+        lo_args: list = list(pargs)
+        if psql:
+            tail_conds.append(f"({psql})")
+        if last_vals is not None:
+            lp, la = self._lexi_gt(pk, last_vals)
+            tail_conds.append(f"({lp})")
+            lo_args.extend(la)
+        tail_where = f" WHERE {' AND '.join(tail_conds)}" if tail_conds else ""
         tail_sql = (f"SELECT {collist} FROM `{resolver.target_schema}`.`{tgt_table}`"
                     f"{tail_where} ORDER BY {pkc_list}")
         t_tail = fetch_all(tgt_conn, tail_sql, tuple(lo_args))
@@ -359,11 +412,11 @@ class VerifyService:
         return result
 
     @staticmethod
-    def _agg_crc(conn, sql: str) -> str:
+    def _agg_crc(conn, sql: str, args: tuple = ()) -> str:
         """无主键整表聚合 CRC（SSCursor 流式，防大表载入内存）。"""
         agg = 0
         with conn.cursor(pymysql.cursors.SSCursor) as cur:
-            cur.execute(sql)
+            cur.execute(sql, args or None)
             while True:
                 rows = cur.fetchmany(10000)
                 if not rows:
@@ -385,8 +438,17 @@ class VerifyService:
 
     # ---------- 修复（以源库覆盖修复选中差异） ----------
     def repair(self, vid: int, *, tables: list[str] | None = None,
-               pks: list[list] | None = None) -> dict:
-        """默认不自动修复——显式 API 触发。返回 {replaced, deleted, skipped}。"""
+               pks: list[list] | None = None,
+               full_tables: list[str] | None = None) -> dict:
+        """默认不自动修复——显式 API 触发。返回 {replaced, deleted, skipped}。
+
+        - diff 修复：按报告记录的差异行（checksum 下钻每表最多保存 100 条）。
+          行过滤子集表仍跳过增删类修复——旧报告口径未按 row_filters 收窄，保留护栏。
+        - full_tables：指定表走「整表对账覆盖」——复用 checksum 分块口径全表比对，
+          不受报告 diff 条数上限约束（差异行全量修复）；行过滤谓词可转 SQL 时校验
+          口径与同步口径一致（只对被同步子集比对），增删类修复同步放开。
+        - 主键：支持单列与复合主键（此前复合主键表差异被静默跳过，T4 修复）。
+        """
         vr = self.verify_repo.get(vid, with_detail=True)
         if not vr:
             raise NotFoundError(f"校验报告 {vid} 不存在")
@@ -401,79 +463,190 @@ class VerifyService:
         tgt: MySQLTarget = self._get_target(task)
         resolver = MappingResolver(task["mapping"], src.default_schema, tgt.default_schema)
         row_filters = task["mapping"].get("row_filters") or {}
+        preds: dict[str, tuple[str, list]] = {}
+        for t, p in row_filters.items():
+            try:
+                preds[t] = predicate_to_sql(p)
+            except PredicateError:
+                preds[t] = None
         src_conn = open_connection(src)
         tgt_conn = open_connection(tgt)
         # 数据源未设 default_schema 时连接无默认库，未限定库名的 DELETE/REPLACE 报 1046
         src_conn.select_db(resolver.source_schema)
         tgt_conn.select_db(resolver.target_schema)
-        replaced = deleted = skipped = 0
+        stats = {"replaced": 0, "deleted": 0, "skipped": 0}
+        full = set(full_tables or [])
         try:
             for table, tr in rows_by_table.items():
                 if tables and table not in tables:
+                    continue
+                row_filtered = table in row_filters
+                pred = preds.get(table)
+                if table in full:
+                    # 口径收窄成功（pred 应用）→ 校验范围与同步范围一致，增删类修复放开；
+                    # 收窄失败 → 保持全表口径 + 增删类护栏
+                    self._repair_full_table(src_conn, tgt_conn, resolver, table,
+                                            row_filtered and pred is None,
+                                            stats, pred=pred)
                     continue
                 diffs = tr.get("diffs") or []
                 if not diffs:
                     continue
                 pk = get_primary_key(src_conn, resolver.source_schema, table)
                 if not pk:
-                    skipped += len(diffs)
+                    stats["skipped"] += len(diffs)
                     continue
                 tgt_table = resolver.target_name(table)
-                pkc = pk[0] if len(pk) == 1 else None
                 cols = self._compare_cols(src_conn, resolver.source_schema, table, pk, set())
                 collist = ", ".join(f"`{c}`" for c in cols)
+                src_table = f"`{resolver.source_schema}`.`{table}`"
                 for d in diffs:
                     if pks and list(d.get("pk") or []) not in [list(p) for p in pks]:
                         continue
-                    if d["type"] == "target_extra":
-                        # 子集同步表禁用孤儿行类修复（目标多余行可能属于过滤范围外语义）
-                        if table in row_filters:
-                            skipped += 1
-                            continue
-                        if pkc is None:
-                            skipped += 1
-                            continue
-                        with tgt_conn.cursor() as cur:
-                            cur.execute(f"DELETE FROM `{tgt_table}` WHERE `{pkc}`=%s",
-                                        (d["pk"][0],))
-                        tgt_conn.commit()
-                        deleted += 1
-                    elif d["type"] == "target_missing":
-                        # 行过滤子集表（E3/E14）：target_missing 很可能只是「被谓词排除的行」
-                        # （verify 的行数/checksum 口径此前未按 row_filters 收窄），
-                        # 禁止回写，否则 repair 会把被过滤行 REPLACE 进目标库，破坏子集语义
-                        if table in row_filters:
-                            skipped += 1
-                            continue
-                        row = fetch_one(src_conn,
-                                        f"SELECT {collist} FROM `{resolver.source_schema}`.`{table}` "
-                                        f"WHERE `{pkc}`=%s", (d["pk"][0],)) if pkc else None
-                        if row is None:
-                            skipped += 1
-                            continue
-                        self._replace_row(tgt_conn, tgt_table, cols, row)
-                        replaced += 1
-                    else:  # mismatch：以源库当前值覆盖
-                        if pkc is None:
-                            skipped += 1
-                            continue
-                        row = fetch_one(src_conn,
-                                        f"SELECT {collist} FROM `{resolver.source_schema}`.`{table}` "
-                                        f"WHERE `{pkc}`=%s", (d["pk"][0],))
-                        if row is None:
-                            # 源库已不存在（校验后又被删）→ 按源库现状删除目标行
-                            with tgt_conn.cursor() as cur:
-                                cur.execute(f"DELETE FROM `{tgt_table}` WHERE `{pkc}`=%s",
-                                            (d["pk"][0],))
-                            tgt_conn.commit()
-                            deleted += 1
-                            continue
-                        self._replace_row(tgt_conn, tgt_table, cols, row)
-                        replaced += 1
+                    self._apply_diff(src_conn, tgt_conn, pk, src_table, tgt_table,
+                                     cols, collist, d, row_filtered, stats)
         finally:
             src_conn.close()
             tgt_conn.close()
-        return {"verify_id": vid, "replaced": replaced, "deleted": deleted, "skipped": skipped}
+        return {"verify_id": vid, **stats}
+
+    @staticmethod
+    def _pk_where(pk: list[str], vals: tuple) -> tuple[str, list]:
+        """按全主键列构造等值条件（支持复合主键）。vals 为报告 diff 记录的 pk 序列。"""
+        return " AND ".join(f"`{c}`=%s" for c in pk), list(vals)
+
+    def _apply_diff(self, src_conn, tgt_conn, pk: list[str], src_table: str,
+                    tgt_table: str, cols: list[str], collist: str, d: dict,
+                    row_filtered: bool, stats: dict) -> None:
+        """按 diff 类型执行单行修复动作（单列/复合主键统一入口）。"""
+        pk_vals = tuple(d.get("pk") or [])
+        dtype = d.get("type")
+        if dtype == "target_extra":
+            # 子集同步表禁用孤儿行类修复（目标多余行可能属于过滤范围外语义）
+            if row_filtered or not pk_vals:
+                stats["skipped"] += 1
+                return
+            self._delete_row(tgt_conn, tgt_table, pk, pk_vals)
+            stats["deleted"] += 1
+        elif dtype == "target_missing":
+            # 行过滤子集表（E3/E14）：target_missing 很可能只是「被谓词排除的行」，
+            # 禁止回写，否则 repair 会把被过滤行 REPLACE 进目标库，破坏子集语义
+            if row_filtered or not pk_vals:
+                stats["skipped"] += 1
+                return
+            w, args = self._pk_where(pk, pk_vals)
+            row = fetch_one(src_conn, f"SELECT {collist} FROM {src_table} WHERE {w}",
+                            tuple(args))
+            if row is None:
+                stats["skipped"] += 1
+                return
+            self._replace_row(tgt_conn, tgt_table, cols, row)
+            stats["replaced"] += 1
+        else:  # mismatch：以源库当前值覆盖
+            if not pk_vals:
+                stats["skipped"] += 1
+                return
+            w, args = self._pk_where(pk, pk_vals)
+            row = fetch_one(src_conn, f"SELECT {collist} FROM {src_table} WHERE {w}",
+                            tuple(args))
+            if row is None:
+                # 源库已不存在（校验后又被删）→ 按源库现状删除目标行
+                self._delete_row(tgt_conn, tgt_table, pk, pk_vals)
+                stats["deleted"] += 1
+                return
+            self._replace_row(tgt_conn, tgt_table, cols, row)
+            stats["replaced"] += 1
+
+    def _repair_full_table(self, src_conn, tgt_conn, resolver: MappingResolver,
+                           table: str, row_filtered: bool, stats: dict,
+                           pred: tuple[str, list] | None = None) -> None:
+        """整表级对账覆盖：复用 checksum 分块口径（keyset + 半开区间）全表比对，
+        不匹配块内差异行全量修复，不受报告 diff 条数（100 条）上限约束。
+
+        pred：行过滤收窄谓词（如有）——两端比对范围与同步范围一致；
+        此时可安全放开增删类修复（row_filtered 由调用方按收窄成败传入）。
+        """
+        pk = get_primary_key(src_conn, resolver.source_schema, table)
+        if not pk:
+            stats["skipped"] += 1
+            return
+        tgt_table = resolver.target_name(table)
+        cols = self._compare_cols(src_conn, resolver.source_schema, table, pk, set())
+        collist = ", ".join(f"`{c}`" for c in cols)
+        src_table = f"`{resolver.source_schema}`.`{table}`"
+        tgt_q = f"`{resolver.target_schema}`.`{tgt_table}`"
+        pkc_list = ", ".join(f"`{c}`" for c in pk)
+        psql, pargs = pred if pred else (None, [])
+        chunk_rows = int(self._p("checksum_chunk_rows", DEFAULT_CHUNK_ROWS))
+        last_vals: tuple | None = None
+        while True:
+            conds: list[str] = []
+            args: list = list(pargs)
+            if psql:
+                conds.append(f"({psql})")
+            if last_vals is not None:
+                lp, la = self._lexi_gt(pk, last_vals)
+                conds.append(f"({lp})")
+                args.extend(la)
+            where = f" WHERE {' AND '.join(conds)}" if conds else ""
+            s_rows = fetch_all(src_conn,
+                               f"SELECT {collist} FROM {src_table}{where} "
+                               f"ORDER BY {pkc_list} LIMIT {int(chunk_rows)}", tuple(args))
+            if not s_rows:
+                break
+            boundary = tuple(s_rows[-1][c] for c in pk)
+            where_parts: list[str] = []
+            t_args: list = list(pargs)
+            if psql:
+                where_parts.append(f"({psql})")
+            if last_vals is not None:
+                p, a = self._lexi_gt(pk, last_vals)
+                where_parts.append(f"({p})")
+                t_args.extend(a)
+            p, a = self._lexi_le(pk, boundary)
+            where_parts.append(f"({p})")
+            t_args.extend(a)
+            t_rows = fetch_all(tgt_conn,
+                               f"SELECT {collist} FROM {tgt_q} "
+                               f"WHERE {' AND '.join(where_parts)} ORDER BY {pkc_list}",
+                               tuple(t_args))
+            last_vals = boundary
+            s_crc = zlib.crc32(b"".join(row_crc(tuple(r.values())).to_bytes(4, "big") for r in s_rows))
+            t_crc = zlib.crc32(b"".join(row_crc(tuple(r.values())).to_bytes(4, "big") for r in t_rows))
+            if s_crc == t_crc and len(s_rows) == len(t_rows):
+                continue
+            s_by_pk = {tuple(r[c] for c in pk): r for r in s_rows}
+            t_by_pk = {tuple(r[c] for c in pk): r for r in t_rows}
+            diffs, _ = diff_rows(s_by_pk, t_by_pk, cols,
+                                 max_diffs=len(s_rows) + len(t_rows))
+            for d in diffs:
+                self._apply_diff(src_conn, tgt_conn, pk, src_table, tgt_table,
+                                 cols, collist, d, row_filtered, stats)
+        # 尾块：源库遍历完后目标库残留行 = 目标多余（孤儿）
+        tail_conds: list[str] = []
+        lo_args: list = list(pargs)
+        if psql:
+            tail_conds.append(f"({psql})")
+        if last_vals is not None:
+            lp, la = self._lexi_gt(pk, last_vals)
+            tail_conds.append(f"({lp})")
+            lo_args.extend(la)
+        tail_where = f" WHERE {' AND '.join(tail_conds)}" if tail_conds else ""
+        t_tail = fetch_all(tgt_conn,
+                           f"SELECT {collist} FROM {tgt_q}{tail_where} ORDER BY {pkc_list}",
+                           tuple(lo_args))
+        for r in t_tail:
+            if row_filtered:
+                stats["skipped"] += 1
+                continue
+            self._delete_row(tgt_conn, tgt_table, pk, tuple(r[c] for c in pk))
+            stats["deleted"] += 1
+
+    def _delete_row(self, tgt_conn, tgt_table: str, pk: list[str], vals: tuple) -> None:
+        w, args = self._pk_where(pk, vals)
+        with tgt_conn.cursor() as cur:
+            cur.execute(f"DELETE FROM `{tgt_table}` WHERE {w}", tuple(args))
+        tgt_conn.commit()
 
     @staticmethod
     def _replace_row(tgt_conn, tgt_table: str, cols: list[str], row: dict) -> None:

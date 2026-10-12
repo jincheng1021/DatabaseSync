@@ -3,7 +3,7 @@
  * 校验报告页（T4.6 / §6.2 页面 9）：报告列表 → 逐表结果 → 不一致块行级差异明细
  * （差异列高亮、两端值对照）→「以源库覆盖修复选中差异」带二次确认。
  */
-import { computed, h, onMounted, ref } from 'vue'
+import { computed, h, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   NAlert, NButton, NCard, NDataTable, NDrawer, NDrawerContent, NPagination, NSelect,
@@ -34,6 +34,14 @@ const showDetail = ref(false)
 const detail = ref<VerifyResultDetail | null>(null)
 const detailLoading = ref(false)
 const drillTable = ref<string | null>(null)
+
+// 修复范围模式：diff = 按报告记录差异行（每表 ≤100 条）；full = 整表对账覆盖（不受上限约束）
+const repairMode = ref<'diff' | 'full'>('diff')
+const repairModeOptions: SelectOption[] = [
+  { label: '按报告差异行修复', value: 'diff' },
+  { label: '整表对账覆盖（不受差异条数上限约束）', value: 'full' },
+]
+watch(drillTable, () => { repairMode.value = 'diff' })
 
 async function load() {
   loading.value = true
@@ -115,7 +123,14 @@ const tableRows = computed<Array<{ name: string; result: VerifyTableResult }>>((
 })
 
 const drillColumns: DataTableColumns<{ name: string; result: VerifyTableResult }> = [
-  { title: '表名', key: 'name', className: 'mono' },
+  { title: '表名', key: 'name', className: 'mono',
+    render: (r) => h('span', null, [
+      r.result.filtered
+        ? h(NTag, { size: 'tiny', bordered: false, type: 'info',
+            style: 'margin-right: 6px' }, { default: () => '子集口径' })
+        : null,
+      r.name,
+    ]) },
   { title: '状态', key: 'status', width: 100,
     render: (r) => h(NTag, { size: 'small', bordered: false,
       type: r.result.status === 'match' ? 'success' : 'error' },
@@ -189,16 +204,24 @@ function renderDiffDetail(r: VerifyDiff): ReturnType<typeof h> {
 function doRepair() {
   const d = detail.value
   if (!d) return
+  const fullMode = repairMode.value === 'full' && drillTable.value != null
   dialog.error({
     title: '以源库覆盖修复选中差异',
-    content: `将按源库当前值覆盖目标库差异行（REPLACE 幂等写），目标多余行删除`
-      + `（行过滤子集表的删除类修复会被自动跳过）${drillTable.value ? `，范围：表 ${drillTable.value}` : '，范围：全部差异表'}。`
-      + `此操作直接修改目标库数据，确认执行？`,
+    content: fullMode
+      ? `将对表 ${drillTable.value} 做整表对账覆盖：按源库当前值全表比对并修复（不受报告差异条数上限约束，差异行全量 REPLACE / 目标多余删除）。此操作直接修改目标库数据，确认执行？`
+      : `将按源库当前值覆盖目标库差异行（REPLACE 幂等写），目标多余行删除`
+        + `（行过滤子集表的删除类修复会被自动跳过）${drillTable.value ? `，范围：表 ${drillTable.value}` : '，范围：全部差异表'}。`
+        + `此操作直接修改目标库数据，确认执行？`,
     positiveText: '确认修复', negativeText: '取消',
     onPositiveClick: async () => {
       try {
-        const r = await verifyApi.repair(d.id, drillTable.value
-          ? { tables: [drillTable.value] } : {})
+        let body: Record<string, unknown> = {}
+        if (fullMode) {
+          body = { tables: [drillTable.value], full_tables: [drillTable.value] }
+        } else if (drillTable.value) {
+          body = { tables: [drillTable.value] }
+        }
+        const r = await verifyApi.repair(d.id, body)
         message.success(`修复完成：覆盖 ${r.replaced} 行，删除 ${r.deleted} 行，跳过 ${r.skipped} 行`)
         await openDetail(d)
       } catch (e) {
@@ -267,10 +290,15 @@ function doRepair() {
               :max-height="320" :row-key="diffRowKey" />
           </n-card>
 
-          <n-button type="error" size="small" :disabled="!detail.mismatch_tables"
-            @click="doRepair">以源库覆盖修复选中差异…</n-button>
+          <div style="display: flex; gap: 12px; align-items: center">
+            <n-button type="error" size="small" :disabled="!detail.mismatch_tables"
+              @click="doRepair">以源库覆盖修复选中差异…</n-button>
+            <n-select v-if="drillTable" v-model:value="repairMode" :options="repairModeOptions"
+              size="small" style="width: 300px" />
+          </div>
           <p class="stat-sub" style="margin-top: 8px">
-            修复语义：差异行按源库当前值 REPLACE（幂等）；「目标多余」行删除（行过滤子集表自动跳过此类修复）。
+            修复语义：差异行按源库当前值 REPLACE（幂等）；「目标多余」行删除（行过滤子集表自动跳过此类修复）；
+            支持复合主键表；钻取单表时可切换「整表对账覆盖」全量修复该表差异（不受报告差异条数上限约束）。
             敏感列（password/secret/token 等）已脱敏展示与存储。
           </p>
         </template>

@@ -103,6 +103,12 @@ class VerifyResultRepository:
                 (task_id, run_id, method, trigger, tables_total))
             return int(cur.lastrowid)
 
+    def set_tables_total(self, vid: int, tables_total: int) -> None:
+        """校验线程解析出实际表清单后回填总数（创建时清单未定，create 传 0）。"""
+        with self.db.write_conn() as c:
+            c.execute("UPDATE verify_result SET tables_total=? WHERE id=?",
+                      (int(tables_total), vid))
+
     @staticmethod
     def _dec(row, with_detail: bool = False) -> dict | None:
         if not row:

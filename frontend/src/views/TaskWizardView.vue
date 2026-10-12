@@ -10,11 +10,13 @@ import {
   NSpin, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import {
-  dsApi, dsTableMeta, taskApi, type BatchCreateResult, type Datasource, type PrecheckItem,
-  type ProbeTargetItem, type TargetDbState,
+  dsApi, dsTableMeta, taskApi, ACTION_LABELS, scheduleApi,
+  type BatchCreateResult, type Datasource, type PrecheckItem,
+  type ProbeTargetItem, type TargetDbState, type ScheduleAction,
 } from '../api'
 import { errMsg } from '../api/client'
 import PrecheckPanel from '../components/PrecheckPanel.vue'
+import CronCycleConfig from '../components/CronCycleConfig.vue'
 
 const router = useRouter()
 const message = useMessage()
@@ -281,6 +283,58 @@ const MODE_OPTIONS = [
   { value: 'scheduled_full', label: '仅定时全量（保存即就绪，触发时按目标库状态路由）' },
 ]
 
+// ---- 步骤 3：内联创建调度计划（动作按模式自动识别，策略固定 skip） ----
+const createSchedule = ref(false)
+const schedCron = ref('0 3 * * *')
+const schedTz = ref('Asia/Shanghai')
+const cronCycleRef = ref<InstanceType<typeof CronCycleConfig> | null>(null)
+const schedOkCount = ref<number | null>(null)
+const schedFailCount = ref(0)
+
+const SCHED_ACTION_BY_MODE: Record<'backup_only' | 'init_plus_cdc' | 'scheduled_full', ScheduleAction> = {
+  backup_only: 'backup_export',
+  scheduled_full: 'full_resync',
+  init_plus_cdc: 'cdc_start',
+}
+const schedAction = computed<ScheduleAction>(() => SCHED_ACTION_BY_MODE[form.value.mode])
+
+function schedName(taskName: string): string {
+  return `${taskName} · 定时调度`.slice(0, 128)
+}
+
+function buildScheduleBody(taskName: string): Record<string, unknown> {
+  return {
+    name: schedName(taskName),
+    action: schedAction.value,
+    cron: schedCron.value.trim(),
+    timezone: schedTz.value,
+    enabled: true,
+    overlap_policy: 'skip',
+    misfire_policy: 'skip',
+    // 调度执行 full_resync 时引擎对这两项硬编码默认 true、不读任务配置，
+    // 必须显式传入向导的任务级开关，保证调度行为与用户选择一致
+    action_params: schedAction.value === 'full_resync'
+      ? { safety_net: form.value.safety_net_backup, orphan_cleanup: form.value.orphan_cleanup }
+      : {},
+  }
+}
+
+async function goStep4() {
+  if (createSchedule.value && cronCycleRef.value) {
+    const err = cronCycleRef.value.validate()
+    if (err) {
+      message.warning(err)
+      return
+    }
+    await cronCycleRef.value.refreshPreview()
+    if (cronCycleRef.value.cronError) {
+      message.warning('cron 表达式不合法，请修正后再继续')
+      return
+    }
+  }
+  step.value = 4
+}
+
 const step1Valid = computed(() => !!(sourceId.value && targetId.value && sourceId.value !== targetId.value
   && dsOk('source') && dsOk('target')))
 
@@ -335,7 +389,16 @@ async function submitSingle() {
       orphan_cleanup: form.value.orphan_cleanup,
       migrate_triggers: form.value.migrate_triggers,
     })
-    message.success(`任务「${t.name}」已创建（${t.mode === 'init_plus_cdc' ? '草稿，需发起初始化' : '已就绪'}）`)
+    let schedNote = ''
+    if (createSchedule.value) {
+      try {
+        await scheduleApi.create(t.id, buildScheduleBody(t.name))
+        schedNote = '，并已创建调度计划'
+      } catch {
+        message.warning('调度计划创建失败，任务已创建；请前往任务详情页「调度」页签补配')
+      }
+    }
+    message.success(`任务「${t.name}」已创建（${t.mode === 'init_plus_cdc' ? '草稿，需发起初始化' : '已就绪'}）${schedNote}`)
     router.push({ name: 'tasks' })
   } catch (e) {
     message.error(errMsg(e))
@@ -365,8 +428,20 @@ async function submitBatch() {
     batchResult.value = r
     const n = r.created.length
     const f = r.failed.length
+    let schedNote = ''
+    if (createSchedule.value && r.created.length) {
+      const results = await Promise.allSettled(
+        r.created.map((c) => scheduleApi.create(c.task_id, buildScheduleBody(c.name))))
+      const ok = results.filter((x) => x.status === 'fulfilled').length
+      schedOkCount.value = ok
+      schedFailCount.value = results.length - ok
+      schedNote = ok ? `，已为 ${ok} 个任务创建调度计划` : ''
+      if (schedFailCount.value) {
+        message.warning(`调度计划创建成功 ${ok} 个 / 失败 ${schedFailCount.value} 个，失败任务请前往详情页「调度」页签补配`)
+      }
+    }
     message.success(`批量创建完成：成功 ${n} 个${f ? `，失败 ${f} 个` : ''}`
-      + (r.init_enqueued.length ? `，已排队初始化 ${r.init_enqueued.length} 个` : ''))
+      + (r.init_enqueued.length ? `，已排队初始化 ${r.init_enqueued.length} 个` : '') + schedNote)
   } catch (e) {
     message.error(errMsg(e))
   } finally {
@@ -581,6 +656,30 @@ const dsOptions = computed(() =>
             <n-switch v-model:value="form.orphan_cleanup" />
             <span style="margin-left: 8px; color: var(--Semantic-Color-text-tertiary); font-size: var(--Font-Size-font-caption)">重刷后删除「目标有源无」的行</span>
           </n-form-item>
+          <n-form-item label="创建调度计划">
+            <n-switch v-model:value="createSchedule" />
+            <span style="margin-left: 8px; color: var(--Semantic-Color-text-tertiary); font-size: var(--Font-Size-font-caption)">
+              创建任务后自动挂载定时调度计划（可在任务详情「调度」页签管理）
+            </span>
+          </n-form-item>
+          <template v-if="createSchedule">
+            <n-form-item label="调度动作（按同步模式自动确定）">
+              <n-tag size="small" :bordered="false">{{ ACTION_LABELS[schedAction] }}</n-tag>
+              <span style="margin-left: 8px; color: var(--Semantic-Color-text-tertiary); font-size: var(--Font-Size-font-caption)">
+                并发策略与错过补偿固定为「跳过」，创建后可在调度页签调整
+              </span>
+            </n-form-item>
+            <n-alert v-if="form.mode === 'init_plus_cdc'" type="info" :bordered="false"
+              style="margin-bottom: 12px">
+              启动增量调度在任务完成初始化（取得位点）后才会生效；初始化完成前的触发会失败并产生告警。
+            </n-alert>
+            <n-alert v-else-if="form.mode === 'scheduled_full'" type="info" :bordered="false"
+              style="margin-bottom: 12px">
+              调度触发时按目标库状态自动路由：空库先初始化，有数据则全量重刷（安全网 / 孤儿清理沿用上方任务级开关）。
+            </n-alert>
+            <CronCycleConfig ref="cronCycleRef" v-model:cron="schedCron"
+              v-model:timezone="schedTz" />
+          </template>
         </n-form>
       </div>
 
@@ -613,10 +712,16 @@ const dsOptions = computed(() =>
               </div>
             </div>
           </div>
+          <n-alert v-if="schedOkCount != null && schedFailCount === 0" type="success" style="margin-bottom: 16px">
+            已为 {{ schedOkCount }} 个任务创建调度计划（{{ ACTION_LABELS[schedAction] }} · <span class="mono">{{ schedCron }}</span> · {{ schedTz }}）
+          </n-alert>
+          <n-alert v-else-if="schedOkCount != null && schedFailCount > 0" type="warning" style="margin-bottom: 16px">
+            调度计划创建成功 {{ schedOkCount }} 个 / 失败 {{ schedFailCount }} 个，失败任务请前往详情页「调度」页签补配。
+          </n-alert>
           <n-button type="primary" @click="router.push({ name: 'tasks' })">前往任务列表</n-button>
         </template>
         <template v-else>
-          <n-alert type="info" :bordered="false" style="margin-bottom: 16px">
+          <n-alert v-if="!createSchedule" type="info" :bordered="false" style="margin-bottom: 16px">
             调度计划（cron / 时区 / 未来 5 次预览）与告警通道在任务详情页「调度」页签配置。
           </n-alert>
           <n-descriptions label-placement="left" bordered :column="1" size="small">
@@ -644,6 +749,9 @@ const dsOptions = computed(() =>
             </n-descriptions-item>
             <n-descriptions-item label="批大小 / 限流"><span class="mono">{{ form.batch_size }}</span> 行/批 · <span class="mono">{{ form.rate_limit_rows }}</span> 行/s</n-descriptions-item>
             <n-descriptions-item label="安全网 / 孤儿清理">{{ form.safety_net_backup ? '开' : '关' }} / {{ form.orphan_cleanup ? '开' : '关' }}</n-descriptions-item>
+            <n-descriptions-item v-if="createSchedule" label="调度计划">
+              {{ ACTION_LABELS[schedAction] }} · <span class="mono">{{ schedCron }}</span> · {{ schedTz }} · 启用
+            </n-descriptions-item>
           </n-descriptions>
         </template>
       </div>
@@ -654,7 +762,7 @@ const dsOptions = computed(() =>
         <n-button v-if="step === 1" type="primary" :disabled="!step1Valid"
           @click="() => { step = 2; loadSchemas(); loadTgtSchemas(); loadTables(); }">下一步</n-button>
         <n-button v-else-if="step === 2" type="primary" :disabled="!step2Valid" @click="step = 3">下一步</n-button>
-        <n-button v-else-if="step === 3" type="primary" @click="step = 4">下一步</n-button>
+        <n-button v-else-if="step === 3" type="primary" @click="goStep4">下一步</n-button>
         <n-button v-else-if="!batchResult" type="primary" :loading="submitting" @click="submit">
           {{ multiDb ? `批量创建 ${pairs.length} 个任务` : '创建任务' }}
         </n-button>

@@ -215,7 +215,8 @@ def create_app() -> FastAPI:
     app.state.orphan_service = OrphanService(
         tasks=app.state.task_repo, runs=app.state.run_repo, tracker=app.state.tracker,
         get_source=_resolve_source, get_target=_resolve_target,
-        alert_repo=app.state.alert_repo, broadcaster=app.state.broadcaster)
+        alert_repo=app.state.alert_repo, broadcaster=app.state.broadcaster,
+        settings=app.state.settings)
     app.state.scheduler = SchedulerService(
         schedules=app.state.schedule_repo, tasks=app.state.task_repo,
         runs=app.state.run_repo, settings=app.state.settings, orch=app.state.orch,

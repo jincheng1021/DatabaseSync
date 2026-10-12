@@ -10,9 +10,53 @@ from app.core.orchestrator import CDC_RUNNING, MODE_LABELS, PAUSED
 from app.schemas.api import DDLDecisionReq
 from app.services.cdc_transform import ddl_kind
 from app.services.mapping_validator import is_subset_mapping, validate_mapping
-from app.services.mysql_client import probe_databases
+from app.services.mysql_client import fetch_all_lc, open_connection, probe_databases
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+
+def _live_schema_columns(ds_service, ds_row: dict | None,
+                         schema: str | None) -> dict[str, list[dict]] | None:
+    """连库取整库列元数据（P0-4 修复：使列过滤深度校验真正生效）。
+
+    单条聚合查询按表分组；连接失败返回 None（不阻塞任务保存，
+    运行时开拷前结构预检 full_engine._precheck_target_structure 兜底拦截）。
+    返回 {表名: [{name, nullable, column_default, column_key}, ...]}。
+    """
+    if not ds_row:
+        return None
+    try:
+        conn = open_connection(ds_service._to_target(ds_row))
+        try:
+            rows = fetch_all_lc(conn,
+                                "SELECT table_name AS tn, column_name AS cn, "
+                                "is_nullable AS nul, column_default AS dflt, column_key AS ck "
+                                "FROM information_schema.columns WHERE table_schema=%s",
+                                (schema,))
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 —— 元数据不可得时降级为警告
+        return None
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["tn"], []).append({
+            "name": r["cn"], "nullable": str(r["nul"]).upper() == "YES",
+            "column_default": r["dflt"], "column_key": r["ck"]})
+    return out
+
+
+def _mapping_filter_meta(ds_service, mapping: dict | None,
+                         source_ds: dict | None, target_ds: dict | None):
+    """P0-4：mapping 含列过滤时取两端列元数据（不涉及列过滤时返回 (None, None, False)。"""
+    if not (mapping or {}).get("column_filter"):
+        return None, None, False
+    src_meta = _live_schema_columns(
+        ds_service, source_ds,
+        (mapping or {}).get("source_database") or (source_ds or {}).get("default_schema"))
+    tgt_meta = _live_schema_columns(
+        ds_service, target_ds,
+        (mapping or {}).get("target_database") or (target_ds or {}).get("default_schema"))
+    return src_meta, tgt_meta, True
 
 
 class TaskCreateReq(BaseModel):
@@ -53,6 +97,10 @@ class FullResyncReq(BaseModel):
 
 class RunActionReq(BaseModel):
     run_id: int | None = None
+
+
+class OrphanCleanupReq(BaseModel):
+    dry_run: bool = False   # True = 只算差集不删除（预览落 run report）
 
 
 # ---- M6：多库批量创建 ----
@@ -141,7 +189,13 @@ def create_task(body: TaskCreateReq, request: Request, actor: dict = Depends(get
         raise ValidationError("源与目标不能为同一数据源")
     # P2 修复：创建路径同样走映射校验（修复前仅更新路径校验，非法谓词/主键列排除可入库）
     if body.mapping:
-        validate_mapping(body.mapping, cdc_enabled=body.mode == "init_plus_cdc")
+        # P0-4 修复：列过滤深度校验需连库列元数据（修复前三处调用均未传 table_meta，
+        # 「排除列不得属于主键/唯一键」规则从未真正执行）
+        table_meta, target_meta, _ = _mapping_filter_meta(
+            s.ds_service, body.mapping,
+            s.ds_service.repo.get(body.source_id), s.ds_service.repo.get(body.target_id))
+        validate_mapping(body.mapping, table_meta=table_meta, target_meta=target_meta,
+                         cdc_enabled=body.mode == "init_plus_cdc")
     # E5：scheduled_full / backup_only 保存即就绪（创建时直接落库，无需再迁移）
     state = "draft" if body.mode == "init_plus_cdc" else "idle"
     task_id = s.task_repo.create({**body.model_dump(), "state": state})
@@ -222,7 +276,11 @@ def batch_create_tasks(body: TaskBatchCreateReq, request: Request,
             continue
         mapping = {**(body.mapping_base or {}), "source_database": src_db, "target_database": tgt_db}
         try:
-            validate_mapping(mapping, cdc_enabled=body.mode == "init_plus_cdc")
+            # P0-4 修复：列过滤深度校验传连库列元数据（元数据不可得时 None 降级跳过）
+            table_meta, target_meta, _ = _mapping_filter_meta(
+                s.ds_service, mapping, src_ds, tgt_ds)
+            validate_mapping(mapping, table_meta=table_meta, target_meta=target_meta,
+                             cdc_enabled=body.mode == "init_plus_cdc")
         except ValidationError as e:
             failed.append({"source_database": src_db, "target_database": tgt_db,
                            "reason": e.message})
@@ -314,7 +372,15 @@ def update_task(task_id: int, body: TaskUpdateReq, request: Request,
             raise ConflictError("任务当前状态不允许修改映射", hint="请先暂停任务")
         mapping = dict(old.get("mapping") or {})
         mapping.update(patch["mapping"] or {})
-        warnings = validate_mapping(mapping, cdc_enabled=old["mode"] == "init_plus_cdc")
+        # P0-4 修复：列过滤深度校验需连库列元数据（元数据不可得时降级为警告不阻塞保存）
+        table_meta, target_meta, need_meta = _mapping_filter_meta(
+            s.ds_service, mapping,
+            s.ds_service.repo.get(old["source_id"]), s.ds_service.repo.get(old["target_id"]))
+        warnings = validate_mapping(mapping, table_meta=table_meta, target_meta=target_meta,
+                                    cdc_enabled=old["mode"] == "init_plus_cdc")
+        if need_meta and table_meta is None:
+            warnings.append("列过滤深度校验未执行（无法连接数据源取列元数据）；"
+                            "运行时开拷前结构预检仍会拦截唯一键/缺列风险")
         patch["mapping"] = mapping
         s.task_repo.update(task_id, patch)
         s.audit.record(actor["username"], "task.update", ip=actor["ip"], object_type="task",
@@ -497,13 +563,20 @@ def recover_task(task_id: int, request: Request, actor: dict = Depends(get_curre
 
 
 @router.post("/{task_id}/orphan-cleanup", status_code=201)
-def orphan_cleanup(task_id: int, request: Request, actor: dict = Depends(get_current_actor)):
-    """T4.4：手动孤儿行清理（行过滤子集表自动跳过；任务开关关闭时拒绝）。"""
+def orphan_cleanup(task_id: int, request: Request, actor: dict = Depends(get_current_actor),
+                   body: OrphanCleanupReq | None = None):
+    """T4.4：手动孤儿行清理（行过滤子集表自动跳过；任务开关关闭时拒绝）。
+
+    body 可省略（向后兼容）；dry_run=true 只算差集与保险丝判定，不删除，
+    预览结果（orphan_count/sample_deleted）落 run report，在执行历史查看。
+    """
     s = _svc(request)
-    run_id = s.orphan_service.start(task_id, trigger="manual")
+    dry_run = bool(body and body.dry_run)
+    run_id = s.orphan_service.start(task_id, trigger="manual", dry_run=dry_run)
     s.audit.record(actor["username"], "task.orphan_cleanup", ip=actor["ip"],
-                   object_type="task", object_id=task_id, after={"run_id": run_id})
-    return {"run_id": run_id}
+                   object_type="task", object_id=task_id,
+                   after={"run_id": run_id, "dry_run": dry_run})
+    return {"run_id": run_id, "dry_run": dry_run}
 
 
 @router.get("/{task_id}/ddl-pending")

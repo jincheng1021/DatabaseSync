@@ -2,14 +2,14 @@
 # 数据库同步工具 · docker-compose（§12 / T5.5，1Panel 适配版）
 #   - data / backups / logs 三卷挂载，:8080 单端口
 #   - restart=unless-stopped，容器日志轮转（防磁盘撑爆）
-#   - 显式网络名 dsync-net：供 1Panel OpenResty 反代加入后
-#     以 http://dsync:8080 直连容器（见 docs/1Panel部署指南.md）
+#   - 加入 1Panel 默认网络 1panel-network（external，OpenResty 本就在
+#     该网络）：反代直接 proxy_pass http://dsync:8080，无需改 OpenResty
 #   - HTTPS 由 1Panel「网站反向代理 + 证书」承担（原 Caddy
 #     https profile 已移除，Caddyfile 仅作非 1Panel 环境留档）
 #
 #   可选环境变量（同目录 .env 文件，1Panel 编排可直接编辑）：
-#     DSYNC_BIND=0.0.0.0   端口绑定地址（仅 1Panel 反代且 OpenResty
-#                          已加入 dsync-net 时可改 127.0.0.1）
+#     DSYNC_BIND=0.0.0.0   端口绑定地址（仅 1Panel 反代直连容器时
+#                          可改 127.0.0.1）
 #     DSYNC_PORT=8080      宿主机端口
 # ============================================================
 services:
@@ -22,6 +22,10 @@ services:
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     image: dsync:latest
+    # 镜像仅本地构建，禁止从任何 registry 拉取：
+    # dsync 是私有镜像，Docker Hub 上不存在；1Panel 创建编排会先拉镜像，
+    # 无此声明时 Docker Hub 被墙 → 拉取超时 → 编排创建中止
+    pull_policy: build
     container_name: dsync
     ports:
       - "${DSYNC_BIND:-0.0.0.0}:${DSYNC_PORT:-8080}:8080"
@@ -50,8 +54,10 @@ services:
       start_period: 15s
       retries: 3
 
-# 显式网络名：1Panel OpenResty 容器加入 dsync-net 后可经
-# http://dsync:8080 反向代理（无需暴露 8080 到公网）
+# 加入 1Panel 默认网络（external，1Panel 安装时自动创建，OpenResty 在此网络）：
+# 反代可直接 proxy_pass http://dsync:8080 容器直连，8080 无需对公网开放
+# 注意：非 1Panel 环境先执行 docker network create 1panel-network，或改回自定义网络
 networks:
   default:
-    name: dsync-net
+    name: 1panel-network
+    external: true

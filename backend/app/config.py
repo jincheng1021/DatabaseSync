@@ -53,6 +53,8 @@ GLOBAL_DEFAULTS: dict[str, object] = {
     "batch_init_parallel": 2,             # 批量初始化并发上限（低性能源库建议 1）
     "db_read_timeout_seconds": 120,       # 连接读超时（含 pymysql 握手读包；低性能库单批查询/commit 可超 30s）
     "db_write_timeout_seconds": 120,      # 连接写超时
+    "orphan_guard_max_ratio": 0.05,       # 孤儿清理保险丝：待删行数 > max(min_rows, 目标行数×比例) 即整表拦截
+    "orphan_guard_min_rows": 1000,        # 孤儿清理保险丝：绝对行数下限
 }
 
 # M1 允许的设置键（设置页只读展示）

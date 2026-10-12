@@ -315,6 +315,32 @@ class FullEngine:
         self._emit("run.finished", {"run_id": run_id, "task_id": task_id, "state": state,
                                     "error": error}, task_id)
 
+    @staticmethod
+    def _partial_summary(report: dict) -> str | None:
+        """P0-2/P2-3 修复：表级失败/行数不一致 → 汇总为 partial 描述（None = 全部成功）。
+
+        此前表级失败只写 report["failed_tables"]、行数不一致只写 row_count_mismatch，
+        run 恒标 success —— 失败表数据旧值/缺失被静默（lw_bzun 现场即此类）。
+        """
+        parts: list[str] = []
+        if report.get("failed_tables"):
+            parts.append(f"表拷贝失败：{', '.join(report['failed_tables'])}")
+        if report.get("row_count_mismatch"):
+            parts.append("行数不一致：" + "，".join(
+                f"{m.get('table')}(源{m.get('source')}/目标{m.get('target')})"
+                for m in report["row_count_mismatch"]))
+        return ("；".join(parts)[:500] or None)
+
+    def _alert_partial(self, task_id: int, msg: str) -> None:
+        if self.alert_repo is not None:
+            try:
+                t = self.tasks.get(task_id) or {}
+                self.alert_repo.fire(f"task_partial:{task_id}",
+                                     f"任务「{t.get('name', task_id)}」全量完成但存在差异：{msg}",
+                                     level="warning", task_id=task_id)
+            except Exception:  # noqa: BLE001 —— 告警失败不影响收尾
+                log.exception("partial 告警发送失败 task=%s", task_id)
+
     def _post_resync_state(self, task: dict, reason: str) -> None:
         """重刷/重做成功后的任务状态：增量引擎仍在运行时必须回 CDC_RUNNING，
         否则任务卡死在 IDLE（binlog 仍在写目标库，但 stop 要求 cdc_running、
@@ -347,7 +373,8 @@ class FullEngine:
             except Exception:  # noqa: BLE001
                 log.exception("重做缓存启动失败 task=%s", task["id"])
         report: dict = {"run_id": run_id, "redo_tables": tables, "warnings": [],
-                        "failed_tables": [], "row_count_mismatch": []}
+                        "failed_tables": [], "row_count_mismatch": [],
+                        "fingerprint_changed": []}
         try:
             src = self._tuned(self._get_source(self.tasks.get(task["id"])))
             tgt = self._tuned(self._get_target(self.tasks.get(task["id"])))
@@ -371,8 +398,14 @@ class FullEngine:
                 self._finalize(src_conn, tgt_conn, src, tgt, resolver, tables, fingerprints, rp, report)
                 if rp.cancel_requested:
                     raise RunAborted()
-                self._finish(run_id, "success", None, report, task["id"])
-                self._post_resync_state(task, "受影响表重做完成")
+                # P0-2/P2-3 修复：失败表/行数不一致 → run 置 partial 并告警
+                partial = self._partial_summary(report)
+                if partial:
+                    self._finish(run_id, "partial", partial, report, task["id"])
+                    self._alert_partial(task["id"], partial)
+                else:
+                    self._finish(run_id, "success", None, report, task["id"])
+                self._post_resync_state(task, "受影响表重做完成" + ("（存在差异，详见执行历史/告警）" if partial else ""))
             finally:
                 src_conn.close()
                 tgt_conn.close()
@@ -466,7 +499,14 @@ class FullEngine:
                 if rp.cancel_requested:
                     raise RunAborted()
                 report["position"] = report.get("position") or {}
-                self._finish(run_id, "success", None, report, task["id"])
+                # P0-2/P2-3 修复：失败表/行数不一致 → run 置 partial 并告警
+                # （增量移交照常进行——位点不受影响，失败表后续可由增量或表重做补齐）
+                partial = self._partial_summary(report)
+                if partial:
+                    self._finish(run_id, "partial", partial, report, task["id"])
+                    self._alert_partial(task["id"], partial)
+                else:
+                    self._finish(run_id, "success", None, report, task["id"])
                 if task["mode"] == "init_plus_cdc" and self.cdc_engine is not None:
                     # M3 移交（T2.6 → T3.2）：增量从 P0 启动，幂等写吸收快照期间重复变更
                     self.orch.transition(task["id"], CDC_RUNNING,
@@ -507,7 +547,8 @@ class FullEngine:
                     safety_net: bool, orphan_cleanup: bool):
         rp = self.tracker.start(run_id, task["id"], "full_resync")
         report: dict = {"run_id": run_id, "warnings": [], "failed_tables": [],
-                        "orphan_deleted": {}, "row_count_mismatch": []}
+                        "orphan_deleted": {}, "orphan_skipped": {}, "orphan_guard": {},
+                        "row_count_mismatch": [], "fingerprint_changed": []}
         safety_backup_ids: list[int] = []
         try:
             src = self._tuned(self._get_source(self.tasks.get(task["id"])))
@@ -521,7 +562,10 @@ class FullEngine:
             try:
                 tgt_conn.select_db(resolver.target_schema)
                 all_tables = [t["name"] for t in list_source_tables(src_conn, resolver.source_schema)]
-                use_tables = tables or all_tables
+                # P0-1 修复：未显式指定表时按映射范围解析（scope/tables 与 init/verify 同口径）。
+                # 此前 use_tables = tables or all_tables 忽略映射 scope —— 映射外表被覆盖写入
+                # 并执行孤儿清理（UI 文案承诺「映射范围内」，与实现不符）。
+                use_tables = tables if tables else resolver.resolve(all_tables)
                 unknown = [t for t in use_tables if t not in all_tables]
                 if unknown:
                     raise ValidationError(f"重刷表在源库不存在：{', '.join(unknown)}")
@@ -558,8 +602,14 @@ class FullEngine:
                                sample_checksum=True)
                 if rp.cancel_requested:
                     raise RunAborted()
-                self._finish(run_id, "success", None, report, task["id"])
-                self._post_resync_state(task, "全量重刷成功")
+                # P0-2/P2-3 修复：表级失败/行数不一致 → run 置 partial 并告警（不得标 success）
+                partial = self._partial_summary(report)
+                if partial:
+                    self._finish(run_id, "partial", partial, report, task["id"])
+                    self._alert_partial(task["id"], partial)
+                else:
+                    self._finish(run_id, "success", None, report, task["id"])
+                self._post_resync_state(task, "全量重刷完成" + ("（存在差异，详见执行历史/告警）" if partial else ""))
                 # M4 T4.2：全量/重刷成功后自动行数校验（trigger=auto）
                 if self.verify_service is not None:
                     try:
@@ -598,6 +648,81 @@ class FullEngine:
     def _show_create(self, conn, table: str) -> str:
         row = fetch_one(conn, f"SHOW CREATE TABLE `{table}`")
         return row["Create Table"] if row and "Create Table" in row else (list(row.values())[1] if row else "")
+
+    # ---- P0-3/P0-4 修复：开拷前结构预检（2026-10-12，lw_bzun 现场） ----
+    @staticmethod
+    def _unique_indexes(conn, schema: str, table: str) -> dict[str, frozenset]:
+        """唯一索引元数据（不含 PRIMARY）：{索引名: 列集}（information_schema.statistics 单查）。"""
+        rows = fetch_all_lc(conn,
+                            "SELECT index_name AS idx, column_name AS col "
+                            "FROM information_schema.statistics "
+                            "WHERE table_schema=%s AND table_name=%s AND non_unique=0",
+                            (schema, table))
+        idx: dict[str, set] = {}
+        for r in rows:
+            if (r.get("idx") or "PRIMARY") == "PRIMARY":
+                continue
+            idx.setdefault(r["idx"], set()).add(r.get("col"))
+        return {k: frozenset(v) for k, v in idx.items()}
+
+    def _precheck_target_structure(self, src_conn, tgt_conn, resolver: MappingResolver,
+                                   table: str, tgt_table: str, cols: list[str],
+                                   excluded: set[str], pk: list[str]) -> str | None:
+        """开拷前结构预检，返回拒刷原因（None = 通过）。
+
+        重刷不迁移结构（P0-3），此前对目标端结构零检测：
+        - 目标表不存在 / 缺待写列 → REPLACE 必失败且此前被吞（P0-2 静默部分成功）；
+        - 两端主键不一致 → 幂等写键位错乱；
+        - 目标独有唯一键（源库无同列集唯一约束）或唯一键含被列过滤排除的列
+          （目标端取默认值）→ REPLACE「先删后插」按该键塌缩去重
+          （lw_bzun 现场：写 219 行存活 140 行，写入零报错）。
+        命中即拒绝拷贝该表（走表级失败隔离；P0-2 修复后 run 置 partial 并告警），
+        不得静默继续。安全判定：源库任一唯一约束（含主键）列集 ⊆ 目标唯一键列集 → 不塌缩。
+        """
+        # 1) 目标表存在性
+        row = fetch_one(tgt_conn,
+                        "SELECT COUNT(*) AS n FROM information_schema.tables "
+                        "WHERE table_schema=%s AND table_name=%s",
+                        (resolver.target_schema, tgt_table))
+        if not row or int(row["n"] or 0) == 0:
+            return (f"目标表 {resolver.target_schema}.{tgt_table} 不存在："
+                    "请先初始化（或表重做）建表后再重刷")
+        # 2) 待写列集必须存在于目标表（源库加列必须显式拦截，不得靠 REPLACE 报错）
+        col_rows = fetch_all_lc(tgt_conn,
+                                "SELECT column_name AS cn FROM information_schema.columns "
+                                "WHERE table_schema=%s AND table_name=%s",
+                                (resolver.target_schema, tgt_table))
+        tgt_cols = {r["cn"] for r in col_rows}
+        missing = [c for c in cols if c not in tgt_cols]
+        if missing:
+            return (f"目标表 {tgt_table} 缺少列 {', '.join(missing)}：源库结构已变更而重刷不迁移结构，"
+                    "请重新初始化该表或先在目标库执行对齐 DDL 后重试")
+        # 3) 主键一致（REPLACE 幂等写键位必须与源库一致）
+        tgt_pk = get_primary_key(tgt_conn, resolver.target_schema, tgt_table)
+        if set(tgt_pk or []) != set(pk or []):
+            return (f"目标表 {tgt_table} 主键 ({', '.join(tgt_pk) or '无'}) 与源库主键 "
+                    f"({', '.join(pk) or '无'}) 不一致：幂等写键位错乱风险，"
+                    "请对齐两端结构（或表重做）后重试")
+        # 4) 唯一索引比对（P0-4）：塌缩风险 → 拒刷
+        src_uni = self._unique_indexes(src_conn, resolver.source_schema, table)
+        tgt_uni = self._unique_indexes(tgt_conn, resolver.target_schema, tgt_table)
+        src_uni_sets = set(src_uni.values())
+        if pk:
+            src_uni_sets.add(frozenset(pk))   # 源主键蕴含唯一性（覆盖目标 (pk, x) 类联合唯一键）
+        risks: list[str] = []
+        for name, ucols in sorted(tgt_uni.items()):
+            overlap = sorted(ucols & excluded)
+            if overlap:
+                risks.append(f"唯一索引 {name}({','.join(sorted(ucols))}) 含被列过滤排除的列 "
+                             f"({', '.join(overlap)})，目标端取默认值，REPLACE 将按该索引塌缩去重")
+            elif not any(s <= ucols for s in src_uni_sets):
+                risks.append(f"唯一索引 {name}({','.join(sorted(ucols))}) 在源库无同列集唯一约束，"
+                             "REPLACE 先删后插会按该索引去重塌缩")
+        if risks:
+            return ("；".join(risks) + "。为防止数据被静默去重（如写 219 行仅存活 140 行），"
+                    "本次拒绝拷贝该表：请先对齐两端索引结构（或移除相关列过滤）后重试")
+        return None
+
 
     def _ensure_target_database(self, src_conn, tgt_conn, src: MySQLTarget,
                                 resolver: MappingResolver) -> None:
@@ -900,6 +1025,14 @@ class FullEngine:
             tgt_table = resolver.target_name(table)
             if not pk:
                 report["warnings"].append(f"表 {table} 无主键：LIMIT/OFFSET 单线程拷贝，断点恢复能力受限")
+            # ---- P0-3/P0-4 修复：开拷前结构预检（目标表/列集/主键/唯一索引比对） ----
+            # 命中即拒刷该表（走表级失败隔离；P0-2 修复后 run 置 partial 并告警）。
+            # init 路径结构刚由源库 DDL 建成，预检恒通过，无额外开销风险。
+            pre_err = self._precheck_target_structure(
+                src_conn, tgt_conn, resolver, table, tgt_table, cols, excluded, pk)
+            if pre_err:
+                report["warnings"].append(f"表 {table} 结构预检拦截：{pre_err}")
+                raise ValidationError(pre_err)
             pk_idxs = [all_cols.index(c) for c in pk] if pk else []   # P2-3：全主键列索引
             checkpoint = self.runs.get_table_checkpoint(run_id, table) or {}
             self.runs.upsert_table(run_id, table, state="copying")
@@ -989,15 +1122,55 @@ class FullEngine:
                         pass
                     src_conn = self._reconnect(src, resolver.source_schema)
             # ---- 孤儿行清理（T2.8/T4.4，仅重刷模式；行过滤子集表自动禁用，E14） ----
-            if replace_mode and orphan_cleanup and pk and len(pk) == 1:
+            # P1-4 修复（lw_bzun 现场）：cleanup_orphans 已重写为 SQL 侧集合差（比较语义
+            # 钉死目标端 collation，杜绝 Python 码点序 vs MySQL collation 序混比误删），
+            # 并带 source_empty/guard_ratio 保险丝。清理失败不得否定已成功的拷贝 ——
+            # 本块独立 try/except，finalize 行数校验仍兜底真实不一致。
+            if replace_mode and orphan_cleanup:
                 if table in (task.get("mapping") or {}).get("row_filters", {}):
+                    report["orphan_skipped"][table] = "行过滤子集表，自动禁用孤儿清理（E14）"
                     report["warnings"].append(f"表 {table} 行过滤子集：跳过孤儿行清理（E14）")
+                elif not pk or len(pk) != 1:
+                    report["orphan_skipped"][table] = "无主键/复合主键表暂不支持清理"
                 else:
-                    from app.services.orphan_service import cleanup_orphans
-                    deleted = cleanup_orphans(src_conn, tgt_conn,
-                                              resolver.source_schema, resolver.target_schema,
-                                              table, resolver.target_name(table), pk[0])
-                    report["orphan_deleted"][table] = deleted
+                    try:
+                        # 源表指纹复核：防「拷贝窗口内源表被 TRUNCATE/重建/换表」型误删
+                        # （清理以源库当前态为基准，基准若已换表则差集无意义）
+                        if table in fingerprints and \
+                                fingerprint(self._show_create(src_conn, table)) != fingerprints[table]:
+                            report["orphan_skipped"][table] = \
+                                "source_schema_drift：拷贝期源表结构变更，跳过孤儿清理"
+                        else:
+                            from app.services.orphan_service import cleanup_orphans
+                            res = cleanup_orphans(src_conn, tgt_conn,
+                                                  resolver.source_schema, resolver.target_schema,
+                                                  table, resolver.target_name(table), pk[0],
+                                                  guard_max_ratio=float(self._p("orphan_guard_max_ratio", 0.05)),
+                                                  guard_min_rows=int(self._p("orphan_guard_min_rows", 1000)))
+                            if res.get("skipped_reason"):
+                                report["orphan_skipped"][table] = res["skipped_reason"]
+                                if res.get("guard"):
+                                    report["orphan_guard"][table] = res["guard"]
+                                    if self.alert_repo:
+                                        try:
+                                            g = res["guard"]
+                                            self.alert_repo.fire(
+                                                f"orphan_guard:{task['id']}:{table}",
+                                                f"孤儿清理拦截：表 {table} 待删 {res['orphan_count']} 行"
+                                                f"超过阈值（目标 {res['target_rows']} 行，"
+                                                f"threshold={g.get('threshold')}），请人工确认",
+                                                level="warning", task_id=task["id"])
+                                        except Exception:  # noqa: BLE001
+                                            log.exception("孤儿清理保险丝告警发送失败 table=%s", table)
+                            else:
+                                report["orphan_deleted"][table] = res["deleted"]
+                                if res.get("collation_conflicts"):
+                                    report["warnings"].append(
+                                        f"表 {table}：{res['collation_conflicts']} 个源端主键值在目标端"
+                                        f"排序规则下塌缩（两端 collation 漂移信号），已按目标端语义判定")
+                    except Exception as e:  # noqa: BLE001 —— 清理失败不影响拷贝结果
+                        log.warning("表 %s 孤儿清理失败（不影响拷贝结果）：%s", table, e)
+                        report["orphan_skipped"][table] = f"cleanup_error: {e}"
             tp.state = "done"
             self.runs.upsert_table(run_id, table, state="done", rows_done=rows_total)
         except TableCancelled:

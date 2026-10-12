@@ -68,6 +68,65 @@ def eval_predicate(pred: dict | None, row: dict) -> bool:
     return _CMP_OPS[op](row.get(col), pred.get("value"))
 
 
+_SQL_OP = {"eq": "=", "ne": "!=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}
+
+
+def predicate_to_sql(pred: dict | None) -> tuple[str | None, list]:
+    """行过滤谓词 → SQL WHERE 片段（verify 口径收窄用），语义与 eval_predicate 对齐。
+
+    返回 (sql 或 None, 绑定参数列表)；None 表示无过滤（恒真）。
+    NULL 语义对齐 Python 端静态求值：
+    - eq None → IS NULL；ne v → (col != v OR col IS NULL)（Python None != v 为 True）；
+    - in 含 None → 补 OR col IS NULL；空 IN → 1 = 0；
+    - gt/ge/lt/le 对 NULL 行两端均为假，SQL 三值逻辑天然一致。
+    结构不合法/含 LIKE 等非静态操作 → PredicateError。
+    """
+    if not pred:
+        return None, []
+    _forbidden(pred)
+    if "and" in pred:
+        parts: list[str] = []
+        args: list = []
+        for p in pred["and"]:
+            s, a = predicate_to_sql(p)
+            if s:
+                parts.append(f"({s})")
+                args.extend(a)
+        return (" AND ".join(parts) if parts else None), args
+    if "or" in pred:
+        parts, args = [], []
+        for p in pred["or"]:
+            s, a = predicate_to_sql(p)
+            if s:
+                parts.append(f"({s})")
+                args.extend(a)
+        if not parts:
+            return "1 = 0", []          # 空分支：any([])=False
+        return " OR ".join(parts), args
+    if "not" in pred:
+        s, a = predicate_to_sql(pred["not"])
+        return (f"NOT ({s})" if s else None), a
+    col = pred["col"]
+    op = str(pred.get("op", "eq")).lower()
+    c = f"`{col}`"
+    if op == "in":
+        vals = pred.get("values", [])
+        if not vals:
+            return "1 = 0", []
+        ph = ", ".join(["%s"] * len(vals))
+        if any(v is None for v in vals):
+            return f"({c} IN ({ph}) OR {c} IS NULL)", list(vals)
+        return f"{c} IN ({ph})", list(vals)
+    if op not in _SQL_OP:
+        raise PredicateError(f"不支持的比较符：{op}")
+    v = pred.get("value")
+    if op == "eq":
+        return (f"{c} IS NULL", []) if v is None else (f"{c} = %s", [v])
+    if op == "ne":
+        return (f"{c} IS NOT NULL", []) if v is None else (f"({c} != %s OR {c} IS NULL)", [v])
+    return f"{c} {_SQL_OP[op]} %s", [v]
+
+
 # ============================================================
 # 操作模型：一个 Op = 一条幂等语句（replace / delete）
 # ============================================================

@@ -144,6 +144,7 @@ export interface VerifyTableResult {
   diff_count?: number
   diffs?: VerifyDiff[]
   warning?: string
+  filtered?: boolean
   src_crc?: string
   tgt_crc?: string
 }

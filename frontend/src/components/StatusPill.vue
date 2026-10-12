@@ -22,6 +22,7 @@ const MAP: Record<string, { color: string; text: string }> = {
   // run / 表级状态
   running: { color: 'var(--Semantic-Color-info)', text: '运行中' },
   success: { color: 'var(--Semantic-Color-success)', text: '成功' },
+  partial: { color: 'var(--Semantic-Color-warning)', text: '完成（有差异）' },
   success_with_mismatch: { color: 'var(--Semantic-Color-warning)', text: '成功（校验不一致）' },
   mismatch: { color: 'var(--Semantic-Color-warning)', text: '校验不一致' },
   cancelled: { color: 'var(--Semantic-Color-text-tertiary)', text: '已取消' },

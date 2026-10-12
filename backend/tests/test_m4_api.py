@@ -81,15 +81,15 @@ def m4client(tmp_path, monkeypatch):
             self.calls.append((task_id, method, trigger))
             return 900 + len(self.calls)
 
-        def repair(self, vid, tables=None, pks=None):
+        def repair(self, vid, tables=None, pks=None, full_tables=None):
             return {"verify_id": vid, "replaced": 2, "deleted": 1, "skipped": 0}
 
     class FakeOrphan:
         def __init__(self):
             self.calls = []
 
-        def start(self, task_id, *, trigger="manual"):
-            self.calls.append((task_id, trigger))
+        def start(self, task_id, *, trigger="manual", dry_run=False):
+            self.calls.append((task_id, trigger, dry_run))
             return 555
 
     class FakeScheduler:
@@ -248,8 +248,13 @@ def test_orphan_cleanup_endpoint(m4client):
     client, app, tid = m4client
     r = client.post(f"/api/tasks/{tid}/orphan-cleanup")
     assert r.status_code == 201, r.text
-    assert r.json() == {"run_id": 555}
-    assert app.orphan_service.calls == [(tid, "manual")]
+    assert r.json() == {"run_id": 555, "dry_run": False}
+    assert app.orphan_service.calls == [(tid, "manual", False)]
+    # dry_run 预览：body 透传 start，不落删除
+    r2 = client.post(f"/api/tasks/{tid}/orphan-cleanup", json={"dry_run": True})
+    assert r2.status_code == 201, r2.text
+    assert r2.json() == {"run_id": 555, "dry_run": True}
+    assert app.orphan_service.calls[-1] == (tid, "manual", True)
 
 
 # ---- 告警通道配置与测试 ----
