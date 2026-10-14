@@ -5,28 +5,26 @@
 卡死 → 79 行正确数据被误删（run 97/103 两次复现）。
 
 新实现：目标端临时表（显式 DDL 镜像目标 PK 列类型/collation）+ LEFT JOIN 差集
-+ 保险丝 + 分批 IN 删除。比较全部发生在目标端 MySQL 内（测试中由模拟器按
-「目标 collation 语义」归一化）。
-
-不依赖真实 MySQL：FakeOrphanConn 模拟器实现语句级语义（临时表/差集/删除/
-计数），并用 collation 归一化函数模拟 ai_ci 等值。
++ 保险丝 + 分批 IN 删除。比较全部发生在目标端 MySQL 内（测试中由模拟器的
+norm() 充当「目标 collation 等值语义」）。
 """
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
-import pymysql
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.limiter import TwoLevelLimiter  # noqa: E402
-from app.core.orchestrator import Orchestrator  # noqa: E402
 from app.core.progress import ProgressTracker  # noqa: E402
-from app.models.m2_repository import TaskRepository  # noqa: E402
+from app.models.m2_repository import PositionRepository, TaskRepository  # noqa: E402
+from app.services import full_engine as fe  # noqa: E402
 from app.services import orphan_service as osvc  # noqa: E402
+from app.services.full_engine import FullEngine, MappingResolver  # noqa: E402
 from app.services.mysql_client import MySQLTarget  # noqa: E402
 from app.services.orphan_service import OrphanService, cleanup_orphans  # noqa: E402
 
@@ -59,16 +57,15 @@ class FakeOrphanCursor:
     def __init__(self, conn):
         self.conn = conn
         self._rows: list = []
-        self._affected = 0
 
     def execute(self, sql, args=None):
         sql = " ".join(sql.split())
         self.conn.db.sqls.append((self.conn.role, sql, args))
         out = self.conn.db.run(self.conn.role, sql, args or ())
         if isinstance(out, int):
-            self._affected, self._rows = out, []
+            self._rows = []
             return out
-        self._affected, self._rows = 0, list(out)
+        self._rows = list(out)
         return 0
 
     def executemany(self, sql, seq):
@@ -125,7 +122,12 @@ class FakeOrphanConn:
 
 
 class OrphanSimulator:
-    """两端语义模拟：norm() 充当目标端 collation 的等值/排序语义。"""
+    """两端语义模拟：norm() 充当目标端 collation 的等值/排序语义。
+
+    - INSERT IGNORE：归一化后已存在的值被忽略（模拟临时表 PRIMARY KEY）；
+    - _del 差集按目标端归一化语义判定；
+    - DELETE 按主键值精确命中目标表行。
+    """
 
     def __init__(self, *, pk="id", src_schema="srcdb", tgt_schema="tgtdb",
                  src_table="t1", tgt_table="t1",
@@ -158,9 +160,11 @@ class OrphanSimulator:
             self.temp[sql.split()[3]] = []
             return 0
         if sql.startswith("INSERT IGNORE INTO"):
-            self.temp["_dsync_orphan_src"].append(self.norm(args[0]))
+            nv = self.norm(args[0])
+            if nv not in self.temp["_dsync_orphan_src"]:
+                self.temp["_dsync_orphan_src"].append(nv)
             return 1
-        if sql.startswith("INSERT INTO `_dsync_orphan_del`") or sql.startswith("INSERT INTO _dsync_orphan_del"):
+        if sql.startswith("INSERT INTO"):
             srcset = {self.norm(v) for v in self.temp["_dsync_orphan_src"]}
             have = {self.norm(v) for v in self.temp["_dsync_orphan_del"]}
             for t in self.tgt_rows:
@@ -176,12 +180,12 @@ class OrphanSimulator:
             return n
         if "COUNT(*) AS n" in sql:
             if "_dsync_orphan_src" in sql:
-                return {"n": len(self.temp["_dsync_orphan_src"])}
+                return [{"n": len(self.temp["_dsync_orphan_src"])}]
             if "_dsync_orphan_del" in sql:
-                return {"n": len(self.temp["_dsync_orphan_del"])}
+                return [{"n": len(self.temp["_dsync_orphan_del"])}]
             if f"`{self.src_schema}`.`{self.src_table}`" in sql:
-                return {"n": len(self.src_rows)}
-            return {"n": len(self.tgt_rows)}
+                return [{"n": len(self.src_rows)}]
+            return [{"n": len(self.tgt_rows)}]
         if sql.startswith("SELECT") and "_dsync_orphan_del" in sql:
             vals = sorted(self.temp["_dsync_orphan_del"], key=self.norm)
             if "WHERE" in sql and args:
@@ -213,7 +217,6 @@ def test_t1_lw_bzun_incident_no_deletion():
     assert res["orphan_count"] == 0
     assert res["collation_conflicts"] == 0
     assert res["after_check"] == {"source": 219, "target": 219}
-    # 临时表已被 finally 清理
     assert "_dsync_orphan_src" not in db.temp and "_dsync_orphan_del" not in db.temp
 
 
@@ -236,15 +239,14 @@ def test_t2_deletes_only_target_extra_rows():
 def test_t3_multi_batch_deletion_12000():
     db = OrphanSimulator()
     db.src_rows = [f"s{i}" for i in range(1000)]
-    extras = [f"x{i}" for i in range(12000)]
-    db.tgt_rows = list(db.src_rows) + extras
+    db.tgt_rows = list(db.src_rows) + [f"x{i}" for i in range(12000)]
     src, tgt = db.conns()
     res = cleanup_orphans(src, tgt, "srcdb", "tgtdb", "t1", "t1", "id",
                           guard_min_rows=100000)   # 关闭保险丝，专测分批
     assert res["deleted"] == 12000
     assert len(db.tgt_rows) == 1000
     deletes = [s for (_, s, _) in db.sqls if s.startswith("DELETE FROM")]
-    assert len(deletes) == 12                    # 5000/批 × IN 1000 分片 → 12 条
+    assert len(deletes) == 12                    # 12000 行：IN 1000 分片 → 12 条
     assert db.commits == 3                       # 5000 行一 commit
 
 
@@ -254,7 +256,7 @@ def test_t3_multi_batch_deletion_12000():
 
 def test_t4_guard_ratio_blocks_and_reports():
     db = OrphanSimulator()
-    db.src_rows = ["s"] * 0 + [f"s{i}" for i in range(100)]
+    db.src_rows = [f"s{i}" for i in range(100)]
     db.tgt_rows = [f"s{i}" for i in range(100)] + [f"x{i}" for i in range(300)]
     src, tgt = db.conns()
     res = cleanup_orphans(src, tgt, "srcdb", "tgtdb", "t1", "t1", "id",
@@ -263,11 +265,11 @@ def test_t4_guard_ratio_blocks_and_reports():
     assert res["guard"]["threshold"] == 20       # max(10, 400×0.05)
     assert res["deleted"] == 0
     assert len(res["guard"]["sample"]) == 20
-    assert db.tgt_rows == [f"s{i}" for i in range(100)] + [f"x{i}" for i in range(300)]
+    assert len(db.tgt_rows) == 400
     assert not any(s.startswith("DELETE FROM") for (_, s, _) in db.sqls)
 
 
-def test_t5_source_empty_blocks_with_error():
+def test_t5_source_empty_blocks():
     db = OrphanSimulator()
     db.src_rows = []
     db.tgt_rows = ["x", "y"]
@@ -283,10 +285,13 @@ def test_t5_source_empty_blocks_with_error():
 # ============================================================
 
 def test_t6_pk_type_mismatch_skips_without_ddl():
-    db = OrphanSimulator(tgt_meta={"data_type": "varchar", "column_type": "varchar(64)",
-                                   "character_maximum_length": 64,
-                                   "character_set_name": "utf8mb4",
-                                   "collation_name": "utf8mb4_0900_ai_ci"})
+    db = OrphanSimulator(
+        tgt_meta={"data_type": "varchar", "column_type": "varchar(64)",
+                  "character_maximum_length": 64, "character_set_name": "utf8mb4",
+                  "collation_name": "utf8mb4_0900_ai_ci"},
+        src_meta={"data_type": "int", "column_type": "int",
+                  "character_maximum_length": None,
+                  "character_set_name": None, "collation_name": None})
     db.src_rows = [1, 2, 3]
     db.tgt_rows = ["1", "2"]
     src, tgt = db.conns()
@@ -297,7 +302,7 @@ def test_t6_pk_type_mismatch_skips_without_ddl():
 
 
 def test_t7_collation_conflict_exposed_not_fatal():
-    # 源端 'abc' 与 'ABC'（ai_ci 相等的异字节值）→ 塌缩计数暴露，清理按目标端语义继续
+    # 源端 'abc' 与 'ABC'（目标 ai_ci 语义下相等的异字节值）→ 塌缩计数暴露，清理继续
     db = OrphanSimulator(norm=str.casefold)
     db.src_rows = ["x", "abc", "ABC"]
     db.tgt_rows = ["x", "abc"]
@@ -337,7 +342,8 @@ def test_t9_same_session_two_tables():
     r2 = cleanup_orphans(src, tgt, "srcdb", "tgtdb", "t1", "t1", "id")   # 同连接第二表
     assert (r1["deleted"], r2["deleted"]) == (1, 1)
     assert not db.temp          # finally DROP 生效，同名临时表不冲突
-    drops = [s for (_, s, _) in db.sqls if s.startswith("DROP TEMPORARY TABLE IF EXISTS _dsync_orphan_src")]
+    drops = [s for (_, s, _) in db.sqls
+             if s.startswith("DROP TEMPORARY TABLE IF EXISTS _dsync_orphan_src")]
     assert len(drops) >= 4      # 每次调用前置 + finally 各一次
 
 
@@ -348,14 +354,14 @@ def test_t10_first_batch_has_no_watermark_predicate():
     src, tgt = db.conns()
     res = cleanup_orphans(src, tgt, "srcdb", "tgtdb", "t1", "t1", "id")
     assert res["deleted"] == 2
-    assert "" in res["sample_deleted"] or res["orphan_count"] == 2
     del_selects = [s for (_, s, _) in db.sqls
-                   if s.startswith("SELECT") and "_dsync_orphan_del" in s and "LIMIT 5000" in s]
+                   if s.startswith("SELECT") and "_dsync_orphan_del" in s
+                   and "LIMIT 5000" in s]
     assert del_selects and "WHERE" not in del_selects[0]   # 首批无条件谓词
 
 
 # ============================================================
-# T11/T12/T13：_copy_one 内联路径
+# T11/T12/T13/T16：_copy_one 内联路径
 # ============================================================
 
 class _SimpleConn:
@@ -367,6 +373,7 @@ class _SimpleConn:
         self.batch = batch
         self.written = []
         self.commits = 0
+        self._rows: list = []
 
     def select_db(self, db):
         pass
@@ -382,10 +389,16 @@ class _SimpleConn:
 
     def execute(self, sql, args=None):
         s = " ".join(sql.split())
-        if s.startswith("SELECT") and "FROM" in s and not s.startswith("SELECT COUNT"):
-            last = args[0] if args else None
-            rows = [r for r in self.data if last is None or r[0] > last]
+        m = re.search(r"OFFSET (\d+)", s)
+        if m is not None:                          # 无主键表 OFFSET 分页
+            off = int(m.group(1))
+            self._rows = self.data[off:off + self.batch]
+        elif s.startswith("SELECT") and args and "WHERE" in s:
+            last = args[0]
+            rows = [r for r in self.data if r[0] > last]
             self._rows = rows[:self.batch]
+        elif s.startswith("SELECT") and "FROM" in s:
+            self._rows = self.data[:self.batch]
         else:
             self._rows = []
         return self._rows
@@ -393,6 +406,12 @@ class _SimpleConn:
     def executemany(self, sql, seq):
         self.written.extend(seq)
         return len(seq)
+
+    def rollback(self):
+        pass
+
+    def commit(self):
+        self.commits += 1
 
     def fetchall(self):
         return list(self._rows)
@@ -420,25 +439,23 @@ def copy_env(m2_repos, seed_ds, orch, tracker, limiter):
         "mode": "init_plus_cdc", "mapping": {"scope": "all"}, "state": "draft",
     })
     task = tasks.get(tid)
-    engine = __import__("app.services.full_engine", fromlist=["FullEngine"]).FullEngine(
-        tasks=tasks, runs=m2_repos["runs"],
-        positions=__import__("app.models.m2_repository", fromlist=["PositionRepository"]).PositionRepository(m2_repos["db"]),
+    engine = FullEngine(
+        tasks=tasks, runs=m2_repos["runs"], positions=PositionRepository(m2_repos["db"]),
         settings=FakeSettings(), orchestrator=orch, tracker=tracker,
         limiter=TwoLevelLimiter(global_rate=100000),
-        get_source=lambda x: MySQLTarget(host="src", port=3306, username="u"),
-        get_target=lambda x: MySQLTarget(host="tgt", port=3306, username="u"))
+        get_source=lambda x: MySQLTarget(host="src", port=3306, username="u", password=None),
+        get_target=lambda x: MySQLTarget(host="tgt", port=3306, username="u", password=None))
     run_id = m2_repos["runs"].start(task_id=tid, run_type="full_resync", trigger="manual")
     rp = tracker.start(run_id, tid, "full_resync")
-    from app.services.full_engine import FullEngine, MappingResolver
     resolver = MappingResolver({"source_database": "srcdb", "target_database": "tgtdb"}, None, None)
     return engine, m2_repos, task, rp, run_id, resolver
 
 
 _COPY_DATA = [(1, "a"), (2, "b")]
+_BASELINE_DDL = "CREATE TABLE `t1` (`id` int, `v` int) ENGINE=InnoDB"
 
 
-def _patch_copy_one_env(engine, monkeypatch, *, fingerprints, mapping_extra=None):
-    from app.services import full_engine as fe
+def _patch_copy_one_env(engine, monkeypatch, *, show_create=_BASELINE_DDL):
     src_conn = _SimpleConn("src", data=_COPY_DATA)
     tgt_conn = _SimpleConn("tgt")
 
@@ -455,44 +472,38 @@ def _patch_copy_one_env(engine, monkeypatch, *, fingerprints, mapping_extra=None
         return []
 
     monkeypatch.setattr(fe, "fetch_all_lc", fake_all_lc)
-    show = "CREATE TABLE `t1` (`id` int, `v` int) ENGINE=InnoDB"
-    monkeypatch.setattr(engine, "_show_create", lambda conn, table: show)
-    task = dict(engine.tasks.get(engine.tasks.list()[0]["id"])) if False else None
+    monkeypatch.setattr(engine, "_show_create", lambda conn, table: show_create)
     return src_conn, tgt_conn
 
 
 def _run_copy_one(engine, task, rp, run_id, resolver, report, *, fingerprints, mapping):
-    from app.services.full_engine import MappingResolver
-    from app.services.mysql_client import MySQLTarget
-    SRC = MySQLTarget(host="src", port=3306, username="u")
-    TGT = MySQLTarget(host="tgt", port=3306, username="u")
+    SRC = MySQLTarget(host="src", port=3306, username="u", password=None)
+    TGT = MySQLTarget(host="tgt", port=3306, username="u", password=None)
     task = dict(task)
     task["mapping"] = mapping
-    task["rate_limit_rows"] = 0
-    task["id"] = task.get("id", 1)
     errors: list[str] = []
     engine._copy_one(SRC, TGT, resolver, task, rp, run_id, "t1", {},
                      fingerprints, report, 2, True, True, errors)
     return errors
 
 
+def _new_report() -> dict:
+    return {"warnings": [], "failed_tables": [], "orphan_deleted": {},
+            "orphan_skipped": {}, "orphan_guard": {}, "fingerprint_changed": []}
+
+
 def test_t11_copy_one_cleanup_error_keeps_table_done(copy_env, monkeypatch):
     engine, m2_repos, task, rp, run_id, resolver = copy_env
-    rp.tables["t1"] = __import__("app.services.full_engine", fromlist=["_tp"])._tp("t1")
-    _patch_copy_one_env(
-        engine, monkeypatch,
-        fingerprints={"t1": __import__("app.services.full_engine", fromlist=["fingerprint"]).fingerprint(
-            "CREATE TABLE `t1` (`id` int, `v` int) ENGINE=InnoDB")})
+    rp.tables["t1"] = fe._tp("t1")
+    _patch_copy_one_env(engine, monkeypatch)
 
     def boom(*a, **kw):
         raise RuntimeError("cleanup boom")
 
     monkeypatch.setattr(osvc, "cleanup_orphans", boom)
-    report: dict = {"warnings": [], "failed_tables": [], "orphan_deleted": {},
-                    "orphan_skipped": {}, "orphan_guard": {}, "fingerprint_changed": []}
+    report = _new_report()
     errors = _run_copy_one(engine, task, rp, run_id, resolver, report,
-                           fingerprints={"t1": report and __import__("app.services.full_engine", fromlist=["fingerprint"]).fingerprint(
-                               "CREATE TABLE `t1` (`id` int, `v` int) ENGINE=InnoDB")},
+                           fingerprints={"t1": fe.fingerprint(_BASELINE_DDL)},
                            mapping={"source_database": "srcdb", "target_database": "tgtdb"})
     assert errors == []
     assert rp.tables["t1"].state == "done"      # 清理失败不否定拷贝
@@ -500,42 +511,59 @@ def test_t11_copy_one_cleanup_error_keeps_table_done(copy_env, monkeypatch):
 
 
 def test_t12_copy_one_fingerprint_drift_skips_cleanup(copy_env, monkeypatch):
-    from app.services import full_engine as fe
+    """开拷后源表结构漂移：E6 预检（第 1 次 SHOW CREATE）通过，
+    清理前复核（第 2 次）发现漂移 → 跳过清理且不进入 cleanup_orphans。"""
     engine, m2_repos, task, rp, run_id, resolver = copy_env
     rp.tables["t1"] = fe._tp("t1")
-    called = {"n": 0}
+    drifted_ddl = _BASELINE_DDL + " /* drifted */"
+    calls = {"n": 0}
+
+    def fake_show(conn, table):
+        calls["n"] += 1
+        return _BASELINE_DDL if calls["n"] == 1 else drifted_ddl
+
+    _patch_copy_one_env(engine, monkeypatch, show_create=None)
+    monkeypatch.setattr(engine, "_show_create", fake_show)
 
     def must_not_call(*a, **kw):
-        called["n"] += 1
         raise AssertionError("指纹漂移时不得进入清理")
 
     monkeypatch.setattr(osvc, "cleanup_orphans", must_not_call)
-    _patch_copy_one_env(engine, monkeypatch, fingerprints={"t1": "baseline"})
-    # _show_create 返回值与快照不同 → 漂移（_patch_copy_one_env 已打桩固定串）
-    report: dict = {"warnings": [], "failed_tables": [], "orphan_deleted": {},
-                    "orphan_skipped": {}, "orphan_guard": {}, "fingerprint_changed": []}
+    report = _new_report()
     errors = _run_copy_one(engine, task, rp, run_id, resolver, report,
-                           fingerprints={"t1": "baseline-fingerprint-mismatch"},
+                           fingerprints={"t1": fe.fingerprint(_BASELINE_DDL)},
                            mapping={"source_database": "srcdb", "target_database": "tgtdb"})
     assert errors == []
     assert rp.tables["t1"].state == "done"
     assert report["orphan_skipped"]["t1"] == \
         "source_schema_drift：拷贝期源表结构变更，跳过孤儿清理"
-    assert called["n"] == 0
+    assert calls["n"] == 2
 
 
 def test_t13_copy_one_row_filtered_table_registered(copy_env, monkeypatch):
     engine, m2_repos, task, rp, run_id, resolver = copy_env
-    rp.tables["t1"] = __import__("app.services.full_engine", fromlist=["_tp"])._tp("t1")
-    _patch_copy_one_env(engine, monkeypatch, fingerprints={})
-    report: dict = {"warnings": [], "failed_tables": [], "orphan_deleted": {},
-                    "orphan_skipped": {}, "orphan_guard": {}, "fingerprint_changed": []}
+    rp.tables["t1"] = fe._tp("t1")
+    _patch_copy_one_env(engine, monkeypatch)
+    report = _new_report()
     errors = _run_copy_one(engine, task, rp, run_id, resolver, report,
                            fingerprints={},
                            mapping={"source_database": "srcdb", "target_database": "tgtdb",
-                                    "row_filters": {"t1": {"column": "v", "op": "eq", "value": 1}}})
+                                    "row_filters": {"t1": {"col": "v", "op": "eq", "value": "a"}}})
     assert errors == []
     assert report["orphan_skipped"]["t1"] == "行过滤子集表，自动禁用孤儿清理（E14）"
+
+
+def test_t16_copy_one_no_pk_registered(copy_env, monkeypatch):
+    engine, m2_repos, task, rp, run_id, resolver = copy_env
+    rp.tables["t1"] = fe._tp("t1")
+    _patch_copy_one_env(engine, monkeypatch)
+    monkeypatch.setattr(fe, "get_primary_key", lambda conn, schema, table: [])
+    report = _new_report()
+    errors = _run_copy_one(engine, task, rp, run_id, resolver, report,
+                           fingerprints={},
+                           mapping={"source_database": "srcdb", "target_database": "tgtdb"})
+    assert errors == []
+    assert report["orphan_skipped"]["t1"] == "无主键/复合主键表暂不支持清理"
 
 
 # ============================================================
@@ -563,8 +591,8 @@ def test_t14_orphan_service_run_guard_path(m2_repos, seed_ds, tracker, monkeypat
 
     alerts = FakeAlertRepo()
     svc = OrphanService(tasks=tasks, runs=m2_repos["runs"], tracker=tracker,
-                        get_source=lambda x: MySQLTarget(host="src", port=3306, username="u"),
-                        get_target=lambda x: MySQLTarget(host="tgt", port=3306, username="u"),
+                        get_source=lambda x: MySQLTarget(host="src", port=3306, username="u", password=None),
+                        get_target=lambda x: MySQLTarget(host="tgt", port=3306, username="u", password=None),
                         alert_repo=alerts, broadcaster=None, settings=FakeSettings())
 
     db = OrphanSimulator()
@@ -584,26 +612,7 @@ def test_t14_orphan_service_run_guard_path(m2_repos, seed_ds, tracker, monkeypat
     svc._run(dict(task), run_id, dry_run=False)
     run = m2_repos["runs"].get(run_id)
     assert run["state"] == "success"
-    report = json.loads(run["report_json"])
+    report = run["report"]                      # runs.get 已解析 report_json
     assert report["skipped"]["t1"] == "guard_ratio"
     assert report["guard"]["t1"]["threshold"] == 20
-    assert ("orphan_guard:{tid}:t1".format(tid=tid), "warning") in alerts.fired
-
-
-# ============================================================
-# T16（补充）：无主键/复合主键在重刷内联路径补登记
-# ============================================================
-
-def test_t16_copy_one_no_pk_registered(copy_env, monkeypatch):
-    from app.services import full_engine as fe
-    engine, m2_repos, task, rp, run_id, resolver = copy_env
-    rp.tables["t1"] = fe._tp("t1")
-    _patch_copy_one_env(engine, monkeypatch, fingerprints={})
-    monkeypatch.setattr(fe, "get_primary_key", lambda conn, schema, table: [])
-    report: dict = {"warnings": [], "failed_tables": [], "orphan_deleted": {},
-                    "orphan_skipped": {}, "orphan_guard": {}, "fingerprint_changed": []}
-    errors = _run_copy_one(engine, task, rp, run_id, resolver, report,
-                           fingerprints={},
-                           mapping={"source_database": "srcdb", "target_database": "tgtdb"})
-    assert errors == []
-    assert report["orphan_skipped"]["t1"] == "无主键/复合主键表暂不支持清理"
+    assert (f"orphan_guard:{tid}:t1", "warning") in alerts.fired

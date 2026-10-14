@@ -410,8 +410,9 @@ export const taskApi = {
     http.post<never, { decision: string; path: string; applied?: number; redo_run_id?: number }>(
       `/api/tasks/${id}/ddl-decision`, { decision, remember }),
   // ---- M4：孤儿行清理 / 映射高级特性 ----
-  orphanCleanup: (id: number) =>
-    http.post<never, { run_id: number }>(`/api/tasks/${id}/orphan-cleanup`),
+  orphanCleanup: (id: number, dryRun = false) =>
+    http.post<never, { run_id: number; dry_run: boolean }>(`/api/tasks/${id}/orphan-cleanup`,
+      dryRun ? { dry_run: true } : undefined),
 }
 
 export interface BackupFile {

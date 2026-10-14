@@ -53,7 +53,14 @@ FLUSH PRIVILEGES;
 
 - DDL 决策为「执行」时需要对目标库的 CREATE/ALTER/DROP/INDEX；
 - 校验修复（REPLACE + 删除目标多余行）需要 INSERT/UPDATE/DELETE；
-- 恢复（DROP TABLE IF EXISTS + 重建）需要 DROP/CREATE。
+- 恢复（DROP TABLE IF EXISTS + 重建）需要 DROP/CREATE；
+- **孤儿行清理（2026-10-12 修复后）**：在目标库会话内创建临时表做集合差比对，
+  需要 `CREATE TEMPORARY TABLES` 权限（库级即可）。缺失时报错信息含权限名；
+  临时表随会话结束自动消亡，不落 binlog、不占长期空间：
+
+  ```sql
+  GRANT CREATE TEMPORARY TABLES ON 目标库.* TO 'dsync'@'%';
+  ```
 
 ## 3. 认证插件：caching_sha2_password（MySQL 8.0）
 

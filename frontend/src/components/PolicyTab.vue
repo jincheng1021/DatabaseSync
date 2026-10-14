@@ -54,12 +54,30 @@ async function save() {
 function doOrphanCleanup() {
   dialog.warning({
     title: '手动孤儿行清理',
-    content: '将按主键归并比对删除「目标有源无」行；行过滤子集表自动跳过。确认执行？',
+    content: '将按目标端主键语义做集合差比对，删除「目标有源无」行；'
+      + '行过滤子集表自动跳过，待删量超阈值（保险丝）会整表拦截。确认执行？',
     positiveText: '发起清理', negativeText: '取消',
     onPositiveClick: async () => {
       try {
         await taskApi.orphanCleanup(props.taskId)
         message.success('孤儿行清理已发起，可在「执行历史」页查看进度')
+      } catch (e) {
+        message.error(errMsg(e))
+      }
+    },
+  })
+}
+
+function doOrphanPreview() {
+  dialog.info({
+    title: '预览孤儿清理（不删除）',
+    content: '只计算差集与保险丝判定，不删除任何数据；'
+      + '待删行数与抽样结果写入 run 报告，可在「执行历史」页查看。确认发起预览？',
+    positiveText: '发起预览', negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        await taskApi.orphanCleanup(props.taskId, true)
+        message.success('孤儿清理预览已发起（不删除），结果见「执行历史」页该 run 的报告')
       } catch (e) {
         message.error(errMsg(e))
       }
@@ -113,6 +131,7 @@ async function doVerify(method: 'row_count' | 'checksum') {
     </n-form>
     <div style="margin-top: 12px; display: flex; gap: 8px">
       <n-button size="small" type="primary" :loading="busy" @click="save">保存策略</n-button>
+      <n-button size="small" secondary @click="doOrphanPreview">预览孤儿清理</n-button>
       <n-button size="small" secondary @click="doOrphanCleanup">手动孤儿行清理</n-button>
       <n-button size="small" secondary @click="doVerify('row_count')">行数校验</n-button>
       <n-button size="small" secondary @click="doVerify('checksum')">checksum 校验</n-button>
